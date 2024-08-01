@@ -123,6 +123,8 @@ mod bencode {
                 )
             }
             Value::Dict(d) => {
+                let mut d: Vec<_> = d.iter().collect();
+                d.sort_by_key(|(k, _)| std::str::from_utf8(k).unwrap());
                 format!(
                     "{{{}}}",
                     d.iter()
