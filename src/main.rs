@@ -1,4 +1,5 @@
 use clap::Parser;
+use sha1::Digest;
 
 /// Simple program to greet a person
 #[derive(clap::Parser, Debug)]
@@ -27,17 +28,19 @@ struct Info {
 
 mod bencode {
     use core::panic;
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
-    #[derive(Debug, Clone)]
+    #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum Value {
         Bytes(Vec<u8>),
         Int(i64),
         List(Vec<Value>),
-        Dict(HashMap<String, Value>),
+        Dict(Mapping),
     }
 
-    fn decode_str(encoded_value: &[u8]) -> (Value, &[u8]) {
+    pub type Mapping = BTreeMap<String, Value>;
+
+    fn decode_bytes(encoded_value: &[u8]) -> (Value, &[u8]) {
         let idx = encoded_value
             .iter()
             .position(|&a| a == b':')
@@ -88,7 +91,7 @@ mod bencode {
     }
 
     pub fn decode_dict(encoded_value: &[u8]) -> (Value, &[u8]) {
-        let mut dict = HashMap::new();
+        let mut dict = Mapping::new();
         let mut l = &encoded_value[1..];
         loop {
             if l[0] == b'e' {
@@ -119,7 +122,7 @@ mod bencode {
             [b'l', ..] => decode_lst(encoded_value),
             [b'd', ..] => decode_dict(encoded_value),
             [b'i', ..] => decode_int(encoded_value),
-            [b'0'..=b'9', ..] => decode_str(encoded_value),
+            [b'0'..=b'9', ..] => decode_bytes(encoded_value),
             _ => {
                 unimplemented!("missing")
             }
@@ -143,8 +146,6 @@ mod bencode {
                 )
             }
             Value::Dict(d) => {
-                let mut d: Vec<_> = d.iter().collect();
-                d.sort_by_key(|s| s.0);
                 format!(
                     "{{{}}}",
                     d.iter()
@@ -156,11 +157,150 @@ mod bencode {
         }
     }
 
-    pub fn extract_dict(value: Value) -> HashMap<String, Value> {
+    pub fn extract_dict(value: Value) -> Mapping {
         if let Value::Dict(d) = value {
             d
         } else {
             panic!("cannot extract dict from Value")
+        }
+    }
+
+    pub fn encode(v: &Value) -> Vec<u8> {
+        let mut buf = Vec::new();
+        encode_inner(v, &mut buf);
+        buf
+    }
+
+    fn encode_inner(v: &Value, buf: &mut Vec<u8>) {
+        match v {
+            Value::Bytes(b) => encode_bytes(b, buf),
+            Value::Int(i) => encode_int(*i, buf),
+            Value::List(l) => encode_list(l, buf),
+            Value::Dict(d) => encode_dict(d, buf),
+        }
+    }
+
+    fn encode_dict(value: &Mapping, buf: &mut Vec<u8>) {
+        buf.push(b'd');
+        for (k, v) in value {
+            let k = k.as_bytes();
+            encode_bytes(k, buf);
+            encode_inner(v, buf);
+        }
+        buf.push(b'e');
+    }
+
+    fn encode_list(value: &[Value], buf: &mut Vec<u8>) {
+        buf.push(b'l');
+        for v in value {
+            encode_inner(v, buf);
+        }
+        buf.push(b'e');
+    }
+
+    fn encode_int(value: i64, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(format!("i{}e", value).as_bytes());
+    }
+
+    fn encode_bytes(value: &[u8], buf: &mut Vec<u8>) {
+        buf.extend_from_slice(format!("{}", value.len()).as_bytes());
+        buf.push(b':');
+        buf.extend_from_slice(value);
+    }
+
+    #[cfg(test)]
+    mod test {
+        use super::*;
+        #[test]
+        fn test_decode_bytes() {
+            let b = "5:hello".as_bytes();
+            let (v, r) = decode(b);
+            assert_eq!(r, &[]);
+            assert_eq!(v, Value::Bytes("hello".as_bytes().to_vec()));
+        }
+
+        #[test]
+        fn test_decode_int() {
+            let i = "i52e".as_bytes();
+            let (v, r) = decode(i);
+            assert_eq!(r, &[]);
+            assert_eq!(v, Value::Int(52));
+
+            let b = "i-52e".as_bytes();
+            let (v, r) = decode(b);
+            assert_eq!(r, &[]);
+            assert_eq!(v, Value::Int(-52));
+        }
+
+        #[test]
+        fn test_decode_list() {
+            let l = "l5:helloi52ee".as_bytes();
+            let (v, r) = decode(l);
+            assert_eq!(r, &[]);
+            assert_eq!(
+                v,
+                Value::List(vec![
+                    Value::Bytes("hello".as_bytes().to_vec()),
+                    Value::Int(52)
+                ])
+            );
+        }
+
+        #[test]
+        fn test_decode_dict() {
+            let d = "d3:foo3:bar5:helloi52ee".as_bytes();
+            let (v, r) = decode(d);
+            assert_eq!(r, &[]);
+            let mut d = Mapping::new();
+            d.insert("foo".to_string(), Value::Bytes("bar".as_bytes().to_vec()));
+            d.insert("hello".to_string(), Value::Int(52));
+
+            assert_eq!(v, Value::Dict(d));
+        }
+
+        #[test]
+        fn test_encode_bytes() {
+            let input = Value::Bytes("hello".as_bytes().to_vec());
+            let b = "5:hello".as_bytes();
+            let v = encode(&input);
+            assert_eq!(b, &v);
+        }
+
+        #[test]
+        fn test_encode_int() {
+            let val = Value::Int(52);
+            let i = "i52e".as_bytes();
+            let v = encode(&val);
+            assert_eq!(v, i);
+
+            let val = Value::Int(-52);
+            let i = "i-52e".as_bytes();
+            let v = encode(&val);
+            assert_eq!(v, i);
+        }
+
+        #[test]
+        fn test_encode_list() {
+            let inp = Value::List(vec![
+                Value::Bytes("hello".as_bytes().to_vec()),
+                Value::Int(52),
+            ]);
+            let l = "l5:helloi52ee".as_bytes();
+            let v = encode(&inp);
+            assert_eq!(v, l);
+        }
+
+        #[test]
+        fn test_encode_dict() {
+            let mut d = Mapping::new();
+            d.insert("foo".to_string(), Value::Bytes("bar".as_bytes().to_vec()));
+            d.insert("hello".to_string(), Value::Int(52));
+            let d = Value::Dict(d);
+            let inp = "d3:foo3:bar5:helloi52ee";
+            let v = encode(&d);
+            let v = std::str::from_utf8(&v).unwrap();
+
+            assert_eq!(v, inp);
         }
     }
 }
@@ -177,11 +317,23 @@ fn info(path: std::path::PathBuf) {
     // Tracker URL: http://bittorrent-test-tracker.codecrafters.io/announce
     // Length: 92063
     let info = d["info"].clone();
+    let info_bcode = bencode::encode(&info);
+
+    let mut hasher = sha1::Sha1::default();
+    hasher.update(&info_bcode);
+    let digest = hasher.finalize();
+    let mut f = String::new();
+    for d in digest {
+        f.push_str(&format!("{:0>2x}", d));
+    }
+
     let info = bencode::extract_dict(info);
+
     println!(
-        "Tracker URL: {}\nLength: {}",
+        "Tracker URL: {}\nLength: {}\nInfo Hash: {}",
         bencode::format_helper(&d["announce"]).trim_matches('"'),
-        bencode::format_helper(&info["length"])
+        bencode::format_helper(&info["length"]),
+        f
     );
 }
 
