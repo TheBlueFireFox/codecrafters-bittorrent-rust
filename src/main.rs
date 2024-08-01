@@ -11,6 +11,7 @@ struct Args {
 #[derive(clap::Subcommand, Debug)]
 enum Commands {
     Decode(Decode),
+    Info(Info),
 }
 
 #[derive(clap::Args, Debug)]
@@ -19,11 +20,22 @@ struct Decode {
     bencode: String,
 }
 
+#[derive(clap::Args, Debug)]
+struct Info {
+    path: std::path::PathBuf,
+}
+
 mod bencode {
     use core::panic;
     use std::collections::HashMap;
 
-    use serde_bencode::value::Value;
+    #[derive(Debug, Clone)]
+    pub enum Value {
+        Bytes(Vec<u8>),
+        Int(i64),
+        List(Vec<Value>),
+        Dict(HashMap<String, Value>),
+    }
 
     fn decode_str(encoded_value: &[u8]) -> (Value, &[u8]) {
         let idx = encoded_value
@@ -84,7 +96,9 @@ mod bencode {
             }
             let (k, r) = decode(l);
             let k = if let Value::Bytes(b) = k {
-                b
+                std::str::from_utf8(&b)
+                    .expect("unable to cast to string")
+                    .to_string()
             } else {
                 panic!("Dict structure incorrect -- key has to be string/bytes");
             };
@@ -114,7 +128,13 @@ mod bencode {
 
     pub fn format_helper(curr: &Value) -> String {
         match curr {
-            Value::Bytes(b) => format!("\"{}\"", std::str::from_utf8(b).expect("incorrect bytes"),),
+            Value::Bytes(b) => {
+                let s = match std::str::from_utf8(b) {
+                    Ok(v) => v.to_string(),
+                    Err(_) => format!("{:?}", b),
+                };
+                format!("\"{}\"", s,)
+            }
             Value::Int(i) => format!("{i}"),
             Value::List(l) => {
                 format!(
@@ -124,19 +144,23 @@ mod bencode {
             }
             Value::Dict(d) => {
                 let mut d: Vec<_> = d.iter().collect();
-                d.sort_by_key(|(k, _)| std::str::from_utf8(k).unwrap());
+                d.sort_by_key(|s| s.0);
                 format!(
                     "{{{}}}",
                     d.iter()
-                        .map(|(k, v)| format!(
-                            "{}:{}",
-                            format_helper(&Value::Bytes(k.to_vec())),
-                            format_helper(v)
-                        ))
+                        .map(|(k, v)| format!("\"{}\":{}", k, format_helper(v)))
                         .collect::<Vec<_>>()
                         .join(",")
                 )
             }
+        }
+    }
+
+    pub fn extract_dict(value: Value) -> HashMap<String, Value> {
+        if let Value::Dict(d) = value {
+            d
+        } else {
+            panic!("cannot extract dict from Value")
         }
     }
 }
@@ -146,9 +170,25 @@ fn decode(bencode: &[u8]) {
     println!("{}", bencode::format_helper(&s));
 }
 
+fn info(path: std::path::PathBuf) {
+    let bcode = std::fs::read(path).expect("file exists");
+    let (s, _) = bencode::decode(&bcode);
+    let d = bencode::extract_dict(s);
+    // Tracker URL: http://bittorrent-test-tracker.codecrafters.io/announce
+    // Length: 92063
+    let info = d["info"].clone();
+    let info = bencode::extract_dict(info);
+    println!(
+        "Tracker URL: {}\nLength: {}",
+        bencode::format_helper(&d["announce"]).trim_matches('"'),
+        bencode::format_helper(&info["length"])
+    );
+}
+
 fn main() {
     let args = Args::parse();
     match args.command {
         Commands::Decode(Decode { bencode }) => decode(bencode.as_bytes()),
+        Commands::Info(Info { path }) => info(path),
     }
 }
