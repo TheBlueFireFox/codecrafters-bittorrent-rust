@@ -165,6 +165,14 @@ mod bencode {
         }
     }
 
+    pub fn extract_bytes(value: Value) -> Vec<u8> {
+        if let Value::Bytes(l) = value {
+            l
+        } else {
+            panic!("cannot extract int from Value <{:?}>", value)
+        }
+    }
+
     pub fn encode(v: &Value) -> Vec<u8> {
         let mut buf = Vec::new();
         encode_inner(v, &mut buf);
@@ -310,6 +318,14 @@ fn decode(bencode: &[u8]) {
     println!("{}", bencode::format_helper(&s));
 }
 
+fn digest_to_str(digest: &[u8]) -> String {
+    let mut f = String::new();
+    for d in digest {
+        f.push_str(&format!("{:0>2x}", d));
+    }
+    f
+}
+
 fn info(path: std::path::PathBuf) {
     let bcode = std::fs::read(path).expect("file exists");
     let (s, _) = bencode::decode(&bcode);
@@ -322,18 +338,25 @@ fn info(path: std::path::PathBuf) {
     let mut hasher = sha1::Sha1::default();
     hasher.update(&info_bcode);
     let digest = hasher.finalize();
-    let mut f = String::new();
-    for d in digest {
-        f.push_str(&format!("{:0>2x}", d));
-    }
+    let digest = digest_to_str(digest.as_slice());
 
     let info = bencode::extract_dict(info);
+    let piece_hashes = bencode::extract_bytes(info["pieces"].clone());
+    let pieces: Vec<_> = piece_hashes.chunks_exact(20).map(digest_to_str).collect();
+    let pieces = pieces.join("\n");
 
     println!(
-        "Tracker URL: {}\nLength: {}\nInfo Hash: {}",
+        r#"Tracker URL: {}
+Length: {}
+Info Hash: {}
+Piece Length: {}
+Piece Hashes:
+{}"#,
         bencode::format_helper(&d["announce"]).trim_matches('"'),
         bencode::format_helper(&info["length"]),
-        f
+        digest,
+        bencode::format_helper(&info["piece length"]),
+        pieces
     );
 }
 
