@@ -1,4 +1,7 @@
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::{
+    io::{Read, Write},
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+};
 
 use clap::Parser;
 use serde::Serialize;
@@ -17,12 +20,20 @@ enum Commands {
     Decode(Decode),
     Info(Info),
     Peers(Peers),
+    Handshake(Handshake),
 }
 
 #[derive(clap::Args, Debug)]
 struct Decode {
     /// The path to read from
     bencode: String,
+}
+
+#[derive(clap::Args, Debug)]
+struct Handshake {
+    /// The path to read from
+    path: std::path::PathBuf,
+    addr: SocketAddr,
 }
 
 #[derive(clap::Args, Debug)]
@@ -242,7 +253,7 @@ mod bencode {
         fn test_decode_bytes() {
             let b = "5:hello".as_bytes();
             let (v, r) = decode(b);
-            assert_eq!(r, &[]);
+            assert!(r.is_empty());
             assert_eq!(v, Value::Bytes("hello".as_bytes().to_vec()));
         }
 
@@ -250,12 +261,12 @@ mod bencode {
         fn test_decode_int() {
             let i = "i52e".as_bytes();
             let (v, r) = decode(i);
-            assert_eq!(r, &[]);
+            assert!(r.is_empty());
             assert_eq!(v, Value::Int(52));
 
             let b = "i-52e".as_bytes();
             let (v, r) = decode(b);
-            assert_eq!(r, &[]);
+            assert!(r.is_empty());
             assert_eq!(v, Value::Int(-52));
         }
 
@@ -263,7 +274,7 @@ mod bencode {
         fn test_decode_list() {
             let l = "l5:helloi52ee".as_bytes();
             let (v, r) = decode(l);
-            assert_eq!(r, &[]);
+            assert!(r.is_empty());
             assert_eq!(
                 v,
                 Value::List(vec![
@@ -277,7 +288,7 @@ mod bencode {
         fn test_decode_dict() {
             let d = "d3:foo3:bar5:helloi52ee".as_bytes();
             let (v, r) = decode(d);
-            assert_eq!(r, &[]);
+            assert!(r.is_empty());
             let mut d = Mapping::new();
             d.insert("foo".to_string(), Value::Bytes("bar".as_bytes().to_vec()));
             d.insert("hello".to_string(), Value::Int(52));
@@ -523,15 +534,13 @@ impl TryFrom<bencode::Value> for TrackerResponse {
     }
 }
 
-fn peers(path: impl AsRef<std::path::Path>) {
+fn torrent_file(path: impl AsRef<std::path::Path>) -> TorrentFile {
     let bcode = std::fs::read(path).expect("file exists");
     let (s, _) = bencode::decode(&bcode);
-    let d = bencode::extract_dict(&s);
-    let url = bencode::format_helper(&d["announce"]);
-    let url = url.trim_matches('"');
+    s.try_into().unwrap()
+}
 
-    let torrent: TorrentFile = s.try_into().unwrap();
-
+fn peers_load(torrent: TorrentFile) -> TrackerResponse {
     let params = QueryParams {
         info_hash: torrent.info.hash_raw(),
         peer_id: "00112233445566778899".to_string(),
@@ -541,6 +550,7 @@ fn peers(path: impl AsRef<std::path::Path>) {
         left: torrent.info.length,
         compact: true,
     };
+    let url = torrent.announce;
     let ih = params.hash_info_hash();
     let url = format!(
         "{}?{}&info_hash={}",
@@ -558,14 +568,81 @@ fn peers(path: impl AsRef<std::path::Path>) {
     let f = "failure reason";
     if let Some(b) = v.get(f) {
         let b = bencode::extract_bytes(b);
-        eprintln!("{:?}", std::str::from_utf8(b).unwrap());
-        return;
+        panic!("{:?}", std::str::from_utf8(b).unwrap());
     }
 
-    let tracker: TrackerResponse = v_org.try_into().unwrap();
+    v_org.try_into().unwrap()
+}
+
+fn peers(path: impl AsRef<std::path::Path>) {
+    let torrent = torrent_file(path);
+    let tracker = peers_load(torrent);
     for peer in tracker.peers {
         println!("{}", peer);
     }
+}
+
+#[derive(Debug, Clone)]
+#[repr(C)]
+struct HandshakePacket {
+    // length of the protocol string (BitTorrent protocol) which is 19 (1 byte)
+    length: u8,
+    // the string BitTorrent protocol (19 bytes)
+    protocol_string: [u8; 19], // BitTorrent protocol
+    // eight reserved bytes, which are all set to zero (8 bytes)
+    _reserved: [u8; 8],
+    // sha1 infohash (20 bytes) (NOT the hexadecimal representation, which is 40 bytes long)
+    info_hash: [u8; 20],
+    // peer id (20 bytes) (you can use 00112233445566778899 for this challenge)
+    peer_id: [u8; 20],
+}
+
+impl HandshakePacket {
+    fn new(info_hash: [u8; 20], peer_id: [u8; 20]) -> Self {
+        Self {
+            length: 19,
+            protocol_string: "BitTorrent protocol".as_bytes().try_into().unwrap(),
+            _reserved: [0; 8],
+            info_hash,
+            peer_id,
+        }
+    }
+
+    fn to_slice(&self) -> &[u8; std::mem::size_of::<Self>()] {
+        unsafe { std::mem::transmute(self) }
+    }
+
+    fn from_slice(from: &[u8; std::mem::size_of::<Self>()]) -> &Self {
+        unsafe { std::mem::transmute(from) }
+    }
+}
+
+fn handshake(path: impl AsRef<std::path::Path>, addr: SocketAddr) {
+    let torrent = torrent_file(path);
+    let info_hash = torrent.info.hash_raw();
+
+    let handshake = HandshakePacket::new(
+        info_hash.as_slice().try_into().unwrap(),
+        "00112233445566778899".as_bytes().try_into().unwrap(),
+    );
+
+    let buf = handshake.to_slice();
+    let mut buf_in = [0; std::mem::size_of::<HandshakePacket>()];
+
+    let mut tcp =
+        std::net::TcpStream::connect(addr).expect("able to create TCP connection to peer");
+    tcp.write_all(buf)
+        .expect("able to write the buffer and the the data to the peer");
+
+    tcp.read_exact(&mut buf_in)
+        .expect("able to read the full response");
+
+    let res = HandshakePacket::from_slice(&buf_in);
+
+    println!(
+        "Peer ID: {}",
+        res.peer_id.map(|c| format!("{:0>2x}", c)).join("")
+    );
 }
 
 fn main() {
@@ -574,5 +651,6 @@ fn main() {
         Commands::Decode(Decode { bencode }) => decode(bencode.as_bytes()),
         Commands::Info(Info { path }) => info(path),
         Commands::Peers(Peers { path }) => peers(path),
+        Commands::Handshake(Handshake { path, addr }) => handshake(path, addr),
     }
 }
