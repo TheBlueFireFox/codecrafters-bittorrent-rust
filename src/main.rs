@@ -1,4 +1,7 @@
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+
 use clap::Parser;
+use serde::Serialize;
 use sha1::Digest;
 
 /// Simple program to greet a person
@@ -13,6 +16,7 @@ struct Args {
 enum Commands {
     Decode(Decode),
     Info(Info),
+    Peers(Peers),
 }
 
 #[derive(clap::Args, Debug)]
@@ -23,6 +27,13 @@ struct Decode {
 
 #[derive(clap::Args, Debug)]
 struct Info {
+    /// The path to read from
+    path: std::path::PathBuf,
+}
+
+#[derive(clap::Args, Debug)]
+struct Peers {
+    /// The path to read from
     path: std::path::PathBuf,
 }
 
@@ -157,7 +168,7 @@ mod bencode {
         }
     }
 
-    pub fn extract_dict(value: Value) -> Mapping {
+    pub fn extract_dict(value: &Value) -> &Mapping {
         if let Value::Dict(d) = value {
             d
         } else {
@@ -165,7 +176,15 @@ mod bencode {
         }
     }
 
-    pub fn extract_bytes(value: Value) -> Vec<u8> {
+    pub fn extract_int(value: &Value) -> &i64 {
+        if let Value::Int(d) = value {
+            d
+        } else {
+            panic!("cannot extract int from Value")
+        }
+    }
+
+    pub fn extract_bytes(value: &Value) -> &Vec<u8> {
         if let Value::Bytes(l) = value {
             l
         } else {
@@ -326,38 +345,227 @@ fn digest_to_str(digest: &[u8]) -> String {
     f
 }
 
-fn info(path: std::path::PathBuf) {
+type Sha1Hash = [u8; 20];
+
+#[derive(Debug, Clone)]
+struct TorrentFile {
+    announce: String,
+    info: TorrentInfo,
+}
+
+impl TryFrom<bencode::Value> for TorrentFile {
+    type Error = String;
+
+    fn try_from(value: bencode::Value) -> Result<Self, Self::Error> {
+        let d = if let bencode::Value::Dict(d) = value {
+            d
+        } else {
+            return Err("Unable to convert as top level is not dict".to_string());
+        };
+        Ok(TorrentFile {
+            announce: bencode::format_helper(&d["announce"])
+                .trim_matches('"')
+                .to_string(),
+            info: d["info"].clone().try_into()?,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TorrentInfo {
+    length: usize,
+    name: String,
+    piece_length: usize,
+    pieces: Vec<Sha1Hash>,
+    value: bencode::Value,
+}
+
+impl TorrentInfo {
+    pub fn hash(&self) -> String {
+        let mut hasher = sha1::Sha1::default();
+        hasher.update(&bencode::encode(&self.value));
+        let digest = hasher.finalize();
+        digest_to_str(digest.as_slice())
+    }
+
+    pub fn hash_raw(&self) -> Vec<u8> {
+        let mut hasher = sha1::Sha1::default();
+        hasher.update(&bencode::encode(&self.value));
+        let digest = hasher.finalize();
+        digest.as_slice().to_vec()
+    }
+}
+
+impl TryFrom<bencode::Value> for TorrentInfo {
+    type Error = String;
+
+    fn try_from(value: bencode::Value) -> Result<Self, Self::Error> {
+        let d = if let bencode::Value::Dict(d) = &value {
+            d
+        } else {
+            return Err("Unable to convert as top level is not dict".to_string());
+        };
+
+        let len = bencode::extract_int(&d["length"]);
+        let name = bencode::format_helper(&d["name"])
+            .trim_matches('"')
+            .to_string();
+
+        let piece_length = bencode::extract_int(&d["piece length"]);
+
+        let piece_hashes = bencode::extract_bytes(&d["pieces"]);
+        let pieces: Vec<_> = piece_hashes
+            .chunks_exact(20)
+            .map(|c| c.try_into().unwrap())
+            .collect();
+
+        Ok(Self {
+            length: *len as _,
+            name,
+            piece_length: *piece_length as _,
+            pieces,
+            value,
+        })
+    }
+}
+
+fn info(path: impl AsRef<std::path::Path>) {
     let bcode = std::fs::read(path).expect("file exists");
     let (s, _) = bencode::decode(&bcode);
-    let d = bencode::extract_dict(s);
     // Tracker URL: http://bittorrent-test-tracker.codecrafters.io/announce
     // Length: 92063
-    let info = d["info"].clone();
-    let info_bcode = bencode::encode(&info);
 
-    let mut hasher = sha1::Sha1::default();
-    hasher.update(&info_bcode);
-    let digest = hasher.finalize();
-    let digest = digest_to_str(digest.as_slice());
+    let bcode: TorrentFile = s.try_into().expect("unable to covert into torrent file");
+    let digest = bcode.info.hash();
 
-    let info = bencode::extract_dict(info);
-    let piece_hashes = bencode::extract_bytes(info["pieces"].clone());
-    let pieces: Vec<_> = piece_hashes.chunks_exact(20).map(digest_to_str).collect();
+    let pieces: Vec<_> = bcode.info.pieces.iter().map(|v| digest_to_str(v)).collect();
     let pieces = pieces.join("\n");
 
     println!(
-        r#"Tracker URL: {}
+        r#"Name: {}
+Tracker URL: {}
 Length: {}
 Info Hash: {}
 Piece Length: {}
 Piece Hashes:
 {}"#,
-        bencode::format_helper(&d["announce"]).trim_matches('"'),
-        bencode::format_helper(&info["length"]),
-        digest,
-        bencode::format_helper(&info["piece length"]),
-        pieces
+        bcode.info.name, bcode.announce, bcode.info.length, digest, bcode.info.piece_length, pieces
     );
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct QueryParams {
+    #[serde(skip)]
+    info_hash: Vec<u8>,
+    peer_id: String,
+    port: u16,
+    uploaded: usize,
+    downloaded: usize,
+    left: usize,
+    #[serde(serialize_with = "bool_to_int")]
+    compact: bool,
+}
+
+impl QueryParams {
+    fn hash_info_hash(&self) -> String {
+        let mut v = String::new();
+        for e in &self.info_hash {
+            // compression to make sure that we can same some bytes
+            match e {
+                0x4c => v.push('L'),
+                0x54 => v.push('T'),
+                0x68 => v.push('h'),
+                0x71 => v.push('q'),
+                _ => v.push_str(&format!("%{:0>2x}", e)),
+            }
+        }
+        v
+    }
+}
+
+fn bool_to_int<S>(v: &bool, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let v = if *v { 1 } else { 0 };
+    serializer.serialize_u8(v)
+}
+
+// {"complete": Int(3), "incomplete": Int(0), "interval": Int(60), "min interval": Int(60), "peers": Bytes([165, 232, 33, 77, 201, 42, 178, 62, 82, 89, 200, 248, 178, 62, 85, 20, 201, 33])}
+#[derive(Debug, Clone)]
+struct TrackerResponse {
+    peers: Vec<SocketAddr>,
+}
+
+impl TryFrom<bencode::Value> for TrackerResponse {
+    type Error = String;
+
+    fn try_from(value: bencode::Value) -> Result<Self, Self::Error> {
+        let d = match value {
+            bencode::Value::Dict(d) => d,
+            _ => return Err("unable to extract dict".into()),
+        };
+
+        let peers = match d.get("peers") {
+            None => return Err("missing peers".into()),
+            Some(bencode::Value::Bytes(b)) => b
+                .chunks_exact(6)
+                .map(|v| {
+                    let ip = Ipv4Addr::new(v[0], v[1], v[2], v[3]);
+                    let port = u16::from_be_bytes(v[4..].try_into().unwrap());
+                    SocketAddrV4::new(ip, port).into()
+                })
+                .collect(),
+            Some(_) => return Err("peers has the incorrect type".into()),
+        };
+
+        Ok(Self { peers })
+    }
+}
+
+fn peers(path: impl AsRef<std::path::Path>) {
+    let bcode = std::fs::read(path).expect("file exists");
+    let (s, _) = bencode::decode(&bcode);
+    let d = bencode::extract_dict(&s);
+    let url = bencode::format_helper(&d["announce"]);
+    let url = url.trim_matches('"');
+
+    let torrent: TorrentFile = s.try_into().unwrap();
+
+    let params = QueryParams {
+        info_hash: torrent.info.hash_raw(),
+        peer_id: "00112233445566778899".to_string(),
+        port: 6881,
+        uploaded: 0,
+        downloaded: 0,
+        left: torrent.info.length,
+        compact: true,
+    };
+    let ih = params.hash_info_hash();
+    let url = format!(
+        "{}?{}&info_hash={}",
+        url,
+        serde_urlencoded::to_string(params).expect("able to convert to url encoding"),
+        ih
+    );
+    let body = reqwest::blocking::get(url).expect("able to load url tracker");
+    let b = body
+        .bytes()
+        .expect("able to get bytes from tracker response");
+
+    let (v_org, _) = bencode::decode(b.as_ref());
+    let v = bencode::extract_dict(&v_org);
+    let f = "failure reason";
+    if let Some(b) = v.get(f) {
+        let b = bencode::extract_bytes(b);
+        eprintln!("{:?}", std::str::from_utf8(b).unwrap());
+        return;
+    }
+
+    let tracker: TrackerResponse = v_org.try_into().unwrap();
+    for peer in tracker.peers {
+        println!("{}", peer);
+    }
 }
 
 fn main() {
@@ -365,5 +573,6 @@ fn main() {
     match args.command {
         Commands::Decode(Decode { bencode }) => decode(bencode.as_bytes()),
         Commands::Info(Info { path }) => info(path),
+        Commands::Peers(Peers { path }) => peers(path),
     }
 }
