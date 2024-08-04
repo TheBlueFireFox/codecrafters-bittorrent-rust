@@ -6,6 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use anyhow::Context;
 use clap::Parser;
 
 /// Simple program to greet a person
@@ -94,29 +95,37 @@ Piece Hashes:
     );
 }
 
-async fn peers(path: impl AsRef<Path>) {
-    let torrent = torrent::torrent_file(path).await;
-    let tracker = torrent::peers_load(&torrent).await;
+async fn peers(path: impl AsRef<Path>) -> anyhow::Result<()> {
+    let torrent = torrent::torrent_file(path).await?;
+    let tracker = torrent::peers_load(&torrent).await?;
     for peer in tracker.peers {
         println!("{}", peer);
     }
+
+    Ok(())
 }
 
-async fn handshake(path: impl AsRef<Path>, addr: SocketAddr) {
-    let torrent = torrent::torrent_file(path).await;
+async fn handshake(path: impl AsRef<Path>, addr: SocketAddr) -> anyhow::Result<()> {
+    let torrent = torrent::torrent_file(path).await?;
     let info_hash = torrent.info.hash_raw();
-    let (_, res) = torrent::do_handshake(&info_hash, addr).await;
+    let (_, res) = torrent::do_handshake(&info_hash, addr).await?;
 
     println!(
         "Peer ID: {}",
         res.peer_id.map(|c| format!("{:0>2x}", c)).join("")
     );
+
+    Ok(())
 }
 
-async fn download_piece(out_path: impl AsRef<Path>, path: impl AsRef<Path>, piece_nr: usize) {
+async fn download_piece(
+    out_path: impl AsRef<Path>,
+    path: impl AsRef<Path>,
+    piece_nr: usize,
+) -> anyhow::Result<()> {
     // 1) Read the torrent file to get the tracker URL
     eprintln!("reading torrent file");
-    let torrent = torrent::torrent_file(path).await;
+    let torrent = torrent::torrent_file(path).await?;
 
     assert!(
         torrent.info.pieces.len() > piece_nr,
@@ -125,21 +134,37 @@ async fn download_piece(out_path: impl AsRef<Path>, path: impl AsRef<Path>, piec
 
     // 2) Perform the tracker GET request to get a list of peers
     eprintln!("loading peers");
-    let tracker = torrent::peers_load(&torrent).await;
+    let tracker = torrent::peers_load(&torrent).await?;
 
     // 3) Establish a TCP connection with a peer, and perform a handshake
     // 4) Exchange multiple peer messages to download the file
     // 4.1) Wait for a bitfield message from the peer indicating which pieces it has
-    let peer = tracker.peers[0];
-    let (mut stream, _bf) = torrent::create_peer_connect(&torrent.info, peer).await;
+    let mut s = None;
+    for peer in tracker.peers {
+        eprintln!("using peer nr {}", peer);
+        match torrent::create_peer_connect(&torrent.info, peer)
+            .await
+            .context("while creating a peer connection during a downlaod")
+        {
+            Ok(e) => {
+                s = Some(Ok(e));
+                break;
+            }
+            Err(err) => {
+                s = Some(Err(err));
+            }
+        }
+    }
+
+    let (mut stream, _bf) = s.unwrap()?;
 
     // 4.2) Send an interested message
     eprintln!("sending interesed packet");
-    torrent::send_interested(&mut stream).await;
+    torrent::send_interested(&mut stream).await?;
 
     // 4.3) Wait until you receive an unchoke message back
     eprintln!("waiting for unchoke packet");
-    torrent::wait_for_unchoke(&stream).await;
+    torrent::wait_for_unchoke(&stream).await?;
 
     let piece_length = if torrent.info.pieces.len() - 1 == piece_nr {
         // last piece
@@ -156,31 +181,36 @@ async fn download_piece(out_path: impl AsRef<Path>, path: impl AsRef<Path>, piec
         piece_length,
         &torrent.info.pieces[piece_nr],
     )
-    .await;
+    .await
+    .context("able to download a piece")?;
 
     tokio::fs::write(&out_path, storage)
         .await
-        .expect("able to write content");
+        .context("able to write content")?;
 
     println!(
         "Piece {} downloaded to {}.",
         piece_nr,
         out_path.as_ref().display()
     );
+
+    Ok(())
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     match args.command {
         Commands::Decode(Decode { bencode }) => decode(bencode.as_bytes()),
         Commands::Info(Info { path }) => info(path),
-        Commands::Peers(Peers { path }) => peers(path).await,
-        Commands::Handshake(Handshake { path, addr }) => handshake(path, addr).await,
+        Commands::Peers(Peers { path }) => peers(path).await?,
+        Commands::Handshake(Handshake { path, addr }) => handshake(path, addr).await?,
         Commands::DownloadPiece(DownloadPiece {
             out_path,
             path,
             piece,
-        }) => download_piece(out_path, path, piece).await,
+        }) => download_piece(out_path, path, piece).await?,
     }
+
+    Ok(())
 }

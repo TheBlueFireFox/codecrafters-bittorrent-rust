@@ -3,6 +3,7 @@ use std::{
     path::Path,
 };
 
+use anyhow::Context;
 use bytes::{Buf as _, BufMut};
 use serde::Serialize;
 use sha1::Digest as _;
@@ -174,15 +175,15 @@ impl TryFrom<bencode::Value> for TrackerResponse {
     }
 }
 
-pub async fn torrent_file(path: impl AsRef<Path>) -> TorrentFile {
-    let bcode = tokio::fs::read(path).await.expect("file exists");
+pub async fn torrent_file(path: impl AsRef<Path>) -> anyhow::Result<TorrentFile> {
+    let bcode = tokio::fs::read(path).await.context("file exists")?;
     eprintln!("{}", hex::encode(&bcode));
 
     let (s, _) = bencode::decode(&bcode);
-    s.try_into().unwrap()
+    Ok(s.try_into().unwrap())
 }
 
-pub async fn peers_load(torrent: &TorrentFile) -> TrackerResponse {
+pub async fn peers_load(torrent: &TorrentFile) -> anyhow::Result<TrackerResponse> {
     let params = QueryParams {
         info_hash: torrent.info.hash_raw(),
         peer_id: "00112233445566778899".to_string(),
@@ -197,11 +198,14 @@ pub async fn peers_load(torrent: &TorrentFile) -> TrackerResponse {
     let url = format!(
         "{}?{}&info_hash={}",
         url,
-        serde_urlencoded::to_string(params).expect("able to convert to url encoding"),
+        serde_urlencoded::to_string(params).context("able to convert to url encoding")?,
         ih
     );
 
-    let body = reqwest::get(url).await.expect("able to load url tracker");
+    let body = reqwest::get(url)
+        .await
+        .context("able to load url tracker")?;
+
     let b = body
         .bytes()
         .await
@@ -215,7 +219,7 @@ pub async fn peers_load(torrent: &TorrentFile) -> TrackerResponse {
         panic!("{:?}", std::str::from_utf8(b).unwrap());
     }
 
-    v_org.try_into().unwrap()
+    Ok(v_org.try_into().unwrap())
 }
 
 #[derive(Debug, Clone)]
@@ -281,13 +285,13 @@ async fn read_from_stream(stream: &TcpStream, mut buf: &mut [u8]) -> tokio::io::
     }
 }
 
-async fn write_to_stream(stream: &mut TcpStream, buf: &[u8]) {
+async fn write_to_stream(stream: &mut TcpStream, buf: &[u8]) -> anyhow::Result<()> {
     let mut written = 0;
     loop {
         let ready = stream
             .ready(Interest::WRITABLE)
             .await
-            .expect("while waiting for readable");
+            .context("while waiting for readable")?;
 
         if !ready.is_writable() {
             continue;
@@ -296,20 +300,21 @@ async fn write_to_stream(stream: &mut TcpStream, buf: &[u8]) {
             Ok(n) => {
                 written += n;
                 if written == buf.len() {
-                    break;
+                    break Ok(());
                 }
             }
             Err(ref e) if e.kind() == tokio::io::ErrorKind::WouldBlock => {
                 continue;
             }
-            Err(e) => {
-                panic!("while trying to write to wire {}", e);
-            }
+            Err(e) => Err(e).context("while trying to write to wire")?,
         }
     }
 }
 
-pub async fn do_handshake(info_hash: &[u8], addr: SocketAddr) -> (TcpStream, HandshakePacket) {
+pub async fn do_handshake(
+    info_hash: &[u8],
+    addr: SocketAddr,
+) -> anyhow::Result<(TcpStream, HandshakePacket)> {
     let handshake = HandshakePacket::new(
         info_hash.try_into().unwrap(),
         "00112233445566778899".as_bytes().try_into().unwrap(),
@@ -320,20 +325,22 @@ pub async fn do_handshake(info_hash: &[u8], addr: SocketAddr) -> (TcpStream, Han
 
     let mut stream = tokio::net::TcpStream::connect(addr)
         .await
-        .expect("able to create TCP connection to peer");
+        .context("able to create TCP connection to peer during the handshake")?;
 
-    write_to_stream(&mut stream, buf).await;
+    write_to_stream(&mut stream, buf)
+        .await
+        .context("able to write to stream duirng the handshake")?;
 
     let read_count = read_from_stream(&stream, &mut buf_in)
         .await
-        .expect("able to read from stream");
+        .context("able to read from stream during the handshake period")?;
 
     assert_eq!(read_count, buf_in.len());
 
-    (stream, HandshakePacket::from_slice(&buf_in).clone())
+    Ok((stream, HandshakePacket::from_slice(&buf_in).clone()))
 }
 
-async fn read_peer_message(stream: &TcpStream) -> Vec<u8> {
+async fn read_peer_message(stream: &TcpStream) -> anyhow::Result<Vec<u8>> {
     // Peer messages consist of a message length prefix (4 bytes), message id (1 byte) and a payload (variable size).
     // we are going to load everything upto the payload size in the first run and after that the
     // payload behind it
@@ -342,16 +349,16 @@ async fn read_peer_message(stream: &TcpStream) -> Vec<u8> {
     // read message length + message id
     let mut buf = vec![0; LENGHT_PREFIX];
     match read_from_stream(stream, &mut buf).await {
-        Err(err) => panic!("while reading a peer message {}", err),
-        Ok(0) => panic!("peer closed connection"),
+        Err(err) => return Err(anyhow::anyhow!("while reading a peer message {}", err)),
+        Ok(0) => return Err(anyhow::anyhow!("peer closed connection")),
         Ok(LENGHT_PREFIX) => {}
         Ok(n) => {
-            panic!(
+            return Err(anyhow::anyhow!(
                 "unexpected prefix read size {} -- {:?} -- {}",
                 n,
                 buf,
                 buf.len()
-            );
+            ));
         }
     }
 
@@ -372,43 +379,54 @@ async fn read_peer_message(stream: &TcpStream) -> Vec<u8> {
         ),
     }
 
-    buf
+    Ok(buf)
 }
 
 pub async fn create_peer_connect(
     torrent: &TorrentInfo,
     peer: SocketAddr,
-) -> (tokio::net::TcpStream, Vec<u8>) {
+) -> anyhow::Result<(tokio::net::TcpStream, Vec<u8>)> {
     // 3) Establish a TCP connection with a peer, and perform a handshake
     eprintln!("handshake for peer 0");
-    let (stream, _handshake_response) = do_handshake(&torrent.hash_raw(), peer).await;
+    let (stream, _handshake_response) = do_handshake(&torrent.hash_raw(), peer)
+        .await
+        .context("while handshake")?;
 
     // 4) Exchange multiple peer messages to download the file
     // 4.1) Wait for a bitfield message from the peer indicating which pieces it has
     eprintln!("waiting for bitfield of peer");
-    let bf = wait_for_bitfield(&stream).await;
+    let bf = wait_for_bitfield(&stream)
+        .await
+        .context("waiting for bitfield")?;
 
-    (stream, bf)
+    Ok((stream, bf))
 }
 
 // The first byte of the bitfield corresponds to indices 0 - 7 from high bit to low bit,
 // respectively. The next one 8-15, etc. Spare bits at the end are set to zero.
-pub async fn wait_for_bitfield(stream: &TcpStream) -> Vec<u8> {
-    let bitfield_buf = read_peer_message(stream).await;
+pub async fn wait_for_bitfield(stream: &TcpStream) -> anyhow::Result<Vec<u8>> {
+    let bitfield_buf = read_peer_message(stream)
+        .await
+        .context("reading bitfield message")?;
+
     assert_eq!(bitfield_buf[4], 5);
 
-    bitfield_buf[5..].to_vec()
+    Ok(bitfield_buf[5..].to_vec())
 }
 
-pub async fn send_interested(stream: &mut TcpStream) {
+pub async fn send_interested(stream: &mut TcpStream) -> anyhow::Result<()> {
     let buf = [0, 0, 0, 5, 2];
-    write_to_stream(stream, &buf).await;
+    write_to_stream(stream, &buf)
+        .await
+        .context("while writing to stream")?;
+    Ok(())
 }
 
-pub async fn wait_for_unchoke(stream: &TcpStream) {
-    let unchoke = read_peer_message(stream).await;
+pub async fn wait_for_unchoke(stream: &TcpStream) -> anyhow::Result<()> {
+    let unchoke = read_peer_message(stream).await?;
 
     assert_eq!(unchoke[4], 1);
+    Ok(())
 }
 
 pub async fn send_request_message(
@@ -416,7 +434,7 @@ pub async fn send_request_message(
     piece_nr: usize,
     offset: usize,
     length: usize,
-) {
+) -> anyhow::Result<()> {
     // we can use BytesMut while using a constant buffer :)
     const SIZE: usize = 4 + 1 + 4 + 4 + 4;
     let mut mbuf = [0; SIZE];
@@ -433,15 +451,18 @@ pub async fn send_request_message(
     // length: the length of the block in bytes
     buf.put_u32(length as _);
 
-    write_to_stream(stream, &mbuf).await;
+    write_to_stream(stream, &mbuf)
+        .await
+        .context("writing to stream during a request message")?;
+    Ok(())
 }
 
-pub async fn wait_for_piece(stream: &TcpStream) -> Vec<u8> {
-    let pm = read_peer_message(stream).await;
+pub async fn wait_for_piece(stream: &TcpStream) -> anyhow::Result<Vec<u8>> {
+    let pm = read_peer_message(stream).await?;
 
     assert_eq!(pm[4], 7);
 
-    pm
+    Ok(pm)
 }
 
 pub async fn download_piece(
@@ -449,7 +470,7 @@ pub async fn download_piece(
     piece_nr: usize,
     piece_length: usize,
     piece_hash: &[u8; 20],
-) -> Vec<u8> {
+) -> anyhow::Result<Vec<u8>> {
     // 4.4) Break the piece into blocks of 16 kiB (16 * 1024 bytes)
     let mut storage = Vec::with_capacity(piece_length);
     let step = 16 * 1024;
@@ -466,9 +487,9 @@ pub async fn download_piece(
             offset,
             length + offset
         );
-        send_request_message(stream, piece_nr, offset, length).await;
+        send_request_message(stream, piece_nr, offset, length).await?;
         // 4.6) Wait for a piece message for each block you've requested
-        let block = wait_for_piece(stream).await;
+        let block = wait_for_piece(stream).await?;
 
         let mut b = &block[..];
         let _l_msg_len = b.get_u32();
@@ -500,5 +521,5 @@ pub async fn download_piece(
     assert_eq!(storage.len(), piece_length);
     assert_eq!(digest, &piece_hash[..], "incorrect digest");
 
-    storage
+    Ok(storage)
 }
