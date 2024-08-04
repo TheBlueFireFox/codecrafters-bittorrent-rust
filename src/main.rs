@@ -4,6 +4,7 @@ mod torrent;
 use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use anyhow::Context;
@@ -210,7 +211,7 @@ async fn download_piece(
 async fn download(out_path: impl AsRef<Path>, path: impl AsRef<Path>) -> anyhow::Result<()> {
     // 1) Read the torrent file to get the tracker URL
     eprintln!("reading torrent file");
-    let torrent = torrent::torrent_file(path).await?;
+    let torrent = torrent::torrent_file(&path).await?;
 
     // 2) Perform the tracker GET request to get a list of peers
     eprintln!("loading peers");
@@ -220,20 +221,25 @@ async fn download(out_path: impl AsRef<Path>, path: impl AsRef<Path>) -> anyhow:
     // 4) Exchange multiple peer messages to download the file
     // 4.1) Wait for a bitfield message from the peer indicating which pieces it has
     let mut s = None;
-    for peer in tracker.peers {
-        eprintln!("using peer nr {}", peer);
-        match torrent::create_peer_connect(&torrent.info, peer)
-            .await
-            .context("while creating a peer connection during a downlaod")
-        {
-            Ok(e) => {
-                s = Some(Ok(e));
-                break;
-            }
-            Err(err) => {
-                s = Some(Err(err));
+    'outer: for i in 0..3 {
+        eprintln!("trying to connect to any peer try <{}>", i);
+        for peer in &tracker.peers {
+            eprintln!("using peer nr {}", peer);
+            match torrent::create_peer_connect(&torrent.info, *peer)
+                .await
+                .context("while creating a peer connection during a downlaod")
+            {
+                Ok(e) => {
+                    s = Some(Ok(e));
+                    break 'outer;
+                }
+                Err(err) => {
+                    s = Some(Err(err));
+                }
             }
         }
+
+        tokio::time::sleep(Duration::from_secs_f64(0.5)).await;
     }
 
     let (mut stream, _bf) = s.unwrap()?;
@@ -254,7 +260,7 @@ async fn download(out_path: impl AsRef<Path>, path: impl AsRef<Path>) -> anyhow:
     let mut file = tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(out_path)
+        .open(&out_path)
         .await
         .context("while opening the result file")?;
 
@@ -279,6 +285,12 @@ async fn download(out_path: impl AsRef<Path>, path: impl AsRef<Path>) -> anyhow:
 
         file.write_all(&storage).await?;
     }
+
+    println!(
+        "Downloaded {} to {}.",
+        path.as_ref().display(),
+        out_path.as_ref().display()
+    );
 
     Ok(())
 }
