@@ -8,6 +8,7 @@ use std::{
 
 use anyhow::Context;
 use clap::Parser;
+use tokio::io::AsyncWriteExt;
 
 /// Simple program to greet a person
 #[derive(clap::Parser, Debug)]
@@ -25,6 +26,7 @@ enum Commands {
     Peers(Peers),
     Handshake(Handshake),
     DownloadPiece(DownloadPiece),
+    Download(Download),
 }
 
 #[derive(clap::Args, Debug)]
@@ -59,6 +61,14 @@ struct DownloadPiece {
     /// The path to read from
     path: PathBuf,
     piece: usize,
+}
+
+#[derive(clap::Args, Debug)]
+struct Download {
+    #[clap(short = 'o', long = "to", default_value = ".")]
+    out_path: std::path::PathBuf,
+    /// The path to read from
+    path: PathBuf,
 }
 
 fn decode(bencode: &[u8]) {
@@ -197,6 +207,82 @@ async fn download_piece(
     Ok(())
 }
 
+async fn download(out_path: impl AsRef<Path>, path: impl AsRef<Path>) -> anyhow::Result<()> {
+    // 1) Read the torrent file to get the tracker URL
+    eprintln!("reading torrent file");
+    let torrent = torrent::torrent_file(path).await?;
+
+    // 2) Perform the tracker GET request to get a list of peers
+    eprintln!("loading peers");
+    let tracker = torrent::peers_load(&torrent).await?;
+
+    // 3) Establish a TCP connection with a peer, and perform a handshake
+    // 4) Exchange multiple peer messages to download the file
+    // 4.1) Wait for a bitfield message from the peer indicating which pieces it has
+    let mut s = None;
+    for peer in tracker.peers {
+        eprintln!("using peer nr {}", peer);
+        match torrent::create_peer_connect(&torrent.info, peer)
+            .await
+            .context("while creating a peer connection during a downlaod")
+        {
+            Ok(e) => {
+                s = Some(Ok(e));
+                break;
+            }
+            Err(err) => {
+                s = Some(Err(err));
+            }
+        }
+    }
+
+    let (mut stream, _bf) = s.unwrap()?;
+
+    // 4.2) Send an interested message
+    eprintln!("sending interesed packet");
+    torrent::send_interested(&mut stream).await?;
+
+    // 4.3) Wait until you receive an unchoke message back
+    eprintln!("waiting for unchoke packet");
+    torrent::wait_for_unchoke(&stream).await?;
+
+    // make sure that the slate is clean
+    if out_path.as_ref().exists() {
+        tokio::fs::remove_file(out_path.as_ref()).await?;
+    }
+
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(out_path)
+        .await
+        .context("while opening the result file")?;
+
+    for piece_nr in 0..torrent.info.pieces.len() {
+        let piece_length = if torrent.info.pieces.len() - 1 == piece_nr {
+            // last piece
+            eprintln!("last piece");
+            torrent.info.length % torrent.info.piece_length
+        } else {
+            torrent.info.piece_length
+        };
+
+        // 4.4 - 6)
+        let storage = torrent::download_piece(
+            &mut stream,
+            piece_nr,
+            piece_length,
+            &torrent.info.pieces[piece_nr],
+        )
+        .await
+        .context("able to download a piece")?;
+
+        file.write_all(&storage).await?;
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -210,6 +296,7 @@ async fn main() -> anyhow::Result<()> {
             path,
             piece,
         }) => download_piece(out_path, path, piece).await?,
+        Commands::Download(Download { out_path, path }) => download(out_path, path).await?,
     }
 
     Ok(())
