@@ -7,9 +7,10 @@ use std::{
     time::Duration,
 };
 
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 use clap::Parser;
 use tokio::io::AsyncWriteExt;
+use torrent::digest_to_str;
 
 /// Simple program to greet a person
 #[derive(clap::Parser, Debug)]
@@ -26,6 +27,7 @@ enum Commands {
     Info(Info),
     Peers(Peers),
     Handshake(Handshake),
+    MagnetParse(MagnetParse),
     DownloadPiece(DownloadPiece),
     Download(Download),
 }
@@ -53,6 +55,11 @@ struct Info {
 struct Peers {
     /// The path to read from
     path: PathBuf,
+}
+
+#[derive(clap::Args, Debug)]
+struct MagnetParse {
+    str: String,
 }
 
 #[derive(clap::Args, Debug)]
@@ -129,6 +136,18 @@ async fn handshake(path: impl AsRef<Path>, addr: SocketAddr) -> anyhow::Result<(
     Ok(())
 }
 
+async fn magnet_parse(link: &str) -> anyhow::Result<()> {
+    let link = torrent::TorrentMagnet::try_from(link).map_err(|e| anyhow!("{e}"))?;
+
+    println!(
+        "Tracker URL: {}\nInfo Hash: {}",
+        link.tracker,
+        digest_to_str(&link.hash)
+    );
+
+    Ok(())
+}
+
 async fn download_piece(
     out_path: impl AsRef<Path>,
     path: impl AsRef<Path>,
@@ -170,7 +189,7 @@ async fn download_piece(
     let (mut stream, _bf) = s.unwrap()?;
 
     // 4.2) Send an interested message
-    eprintln!("sending interesed packet");
+    eprintln!("sending interested packet");
     torrent::send_interested(&mut stream).await?;
 
     // 4.3) Wait until you receive an unchoke message back
@@ -245,7 +264,7 @@ async fn download(out_path: impl AsRef<Path>, path: impl AsRef<Path>) -> anyhow:
     let (mut stream, _bf) = s.unwrap()?;
 
     // 4.2) Send an interested message
-    eprintln!("sending interesed packet");
+    eprintln!("sending interested packet");
     torrent::send_interested(&mut stream).await?;
 
     // 4.3) Wait until you receive an unchoke message back
@@ -309,6 +328,7 @@ async fn main() -> anyhow::Result<()> {
             piece,
         }) => download_piece(out_path, path, piece).await?,
         Commands::Download(Download { out_path, path }) => download(out_path, path).await?,
+        Commands::MagnetParse(mp) => magnet_parse(&mp.str).await?,
     }
 
     Ok(())

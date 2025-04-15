@@ -1,10 +1,13 @@
 use std::{
+    collections::HashMap,
+    fmt::Write,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     path::Path,
 };
 
 use anyhow::Context;
 use bytes::{Buf as _, BufMut};
+use rand::distr::{Alphanumeric, SampleString};
 use serde::Serialize;
 use sha1::Digest as _;
 use tokio::{io::Interest, net::TcpStream};
@@ -12,14 +15,57 @@ use tokio::{io::Interest, net::TcpStream};
 use crate::bencode;
 
 pub fn digest_to_str(digest: &[u8]) -> String {
-    let mut f = String::new();
+    let mut f = String::with_capacity(40);
     for d in digest {
-        f.push_str(&format!("{:0>2x}", d));
+        let _ = write!(&mut f, "{:0>2x}", d);
     }
     f
 }
 
 type Sha1Hash = [u8; 20];
+
+#[derive(Debug, Clone)]
+pub struct TorrentMagnet {
+    pub hash: Sha1Hash,
+    pub name: String,
+    pub tracker: String,
+}
+
+impl TryFrom<&str> for TorrentMagnet {
+    type Error = String;
+
+    fn try_from(link: &str) -> Result<Self, Self::Error> {
+        let (magnet, url_encoded) = link
+            .split_once(":?")
+            .ok_or_else(|| "unable to split up the magnet link".to_string())?;
+
+        assert_eq!("magnet", magnet);
+
+        let parts: HashMap<String, String> =
+            serde_urlencoded::from_str(url_encoded).map_err(|e| format!("foo {e}"))?;
+
+        let hash_str = &parts["xt"];
+        let name = &parts["dn"];
+        let tracker = &parts["tr"];
+
+        let (_, hash_str) = hash_str
+            .rsplit_once(":")
+            .ok_or_else(|| "unable to split up the magnet link".to_string())?;
+
+        assert_eq!(40, hash_str.len());
+        let mut hash = [0; 20];
+        for i in (0..40).step_by(2) {
+            hash[i / 2] = u8::from_str_radix(&hash_str[i..i + 2], 16)
+                .map_err(|e| format!("while parsing from radix{e}"))?;
+        }
+
+        Ok(Self {
+            hash,
+            name: name.clone(),
+            tracker: tracker.clone(),
+        })
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct TorrentFile {
@@ -183,10 +229,14 @@ pub async fn torrent_file(path: impl AsRef<Path>) -> anyhow::Result<TorrentFile>
     Ok(s.try_into().unwrap())
 }
 
+pub fn random_peer_id() -> String {
+    Alphanumeric.sample_string(&mut rand::rng(), 20)
+}
+
 pub async fn peers_load(torrent: &TorrentFile) -> anyhow::Result<TrackerResponse> {
     let params = QueryParams {
         info_hash: torrent.info.hash_raw(),
-        peer_id: "00112233445566778899".to_string(),
+        peer_id: random_peer_id(),
         port: 6881,
         uploaded: 0,
         downloaded: 0,
@@ -317,7 +367,7 @@ pub async fn do_handshake(
 ) -> anyhow::Result<(TcpStream, HandshakePacket)> {
     let handshake = HandshakePacket::new(
         info_hash.try_into().unwrap(),
-        "00112233445566778899".as_bytes().try_into().unwrap(),
+        random_peer_id().as_bytes().try_into().unwrap(),
     );
 
     let buf = handshake.to_slice();
@@ -415,7 +465,7 @@ pub async fn wait_for_bitfield(stream: &TcpStream) -> anyhow::Result<Vec<u8>> {
 }
 
 pub async fn send_interested(stream: &mut TcpStream) -> anyhow::Result<()> {
-    let buf = [0, 0, 0, 5, 2];
+    let buf = [0, 0, 0, 1, 2];
     write_to_stream(stream, &buf)
         .await
         .context("while writing to stream")?;
@@ -481,12 +531,12 @@ pub async fn download_piece(
         } else {
             piece_length - offset
         };
-        eprintln!(
-            "downloading {} -- {} -- {}",
-            piece_nr,
-            offset,
-            length + offset
-        );
+        // eprintln!(
+        //     "downloading {} -- {} -- {}",
+        //     piece_nr,
+        //     offset,
+        //     length + offset
+        // );
         send_request_message(stream, piece_nr, offset, length).await?;
         // 4.6) Wait for a piece message for each block you've requested
         let block = wait_for_piece(stream).await?;
