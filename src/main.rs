@@ -196,6 +196,8 @@ async fn download_piece(
     eprintln!("waiting for unchoke packet");
     torrent::wait_for_unchoke(&stream).await?;
 
+    eprintln!("downlading");
+
     let piece_length = if torrent.info.pieces.len() - 1 == piece_nr {
         // last piece
         eprintln!("last piece");
@@ -270,6 +272,8 @@ async fn download(out_path: impl AsRef<Path>, path: impl AsRef<Path>) -> anyhow:
     // 4.3) Wait until you receive an unchoke message back
     eprintln!("waiting for unchoke packet");
     torrent::wait_for_unchoke(&stream).await?;
+
+    eprintln!("downlading");
 
     // make sure that the slate is clean
     if out_path.as_ref().exists() {
