@@ -22,7 +22,7 @@ pub fn digest_to_str(digest: &[u8]) -> String {
     f
 }
 
-type Sha1Hash = [u8; 20];
+pub type Sha1Hash = [u8; 20];
 
 #[derive(Debug, Clone)]
 pub struct TorrentMagnet {
@@ -223,20 +223,26 @@ impl TryFrom<bencode::Value> for TrackerResponse {
 
 pub async fn torrent_file(path: impl AsRef<Path>) -> anyhow::Result<TorrentFile> {
     let bcode = tokio::fs::read(path).await.context("file exists")?;
-    eprintln!("{}", hex::encode(&bcode));
 
     let (s, _) = bencode::decode(&bcode);
     Ok(s.try_into().unwrap())
 }
 
-pub fn random_peer_id() -> String {
-    Alphanumeric.sample_string(&mut rand::rng(), 20)
+pub fn random_peer_id() -> [u8; 20] {
+    Alphanumeric
+        .sample_string(&mut rand::rng(), 20)
+        .as_bytes()
+        .try_into()
+        .unwrap()
 }
 
-pub async fn peers_load(torrent: &TorrentFile) -> anyhow::Result<TrackerResponse> {
+pub async fn peers_load(
+    torrent: &TorrentFile,
+    my_peer_id: [u8; 20],
+) -> anyhow::Result<TrackerResponse> {
     let params = QueryParams {
         info_hash: torrent.info.hash_raw(),
-        peer_id: random_peer_id(),
+        peer_id: String::from_utf8(my_peer_id.to_vec())?,
         port: 6881,
         uploaded: 0,
         downloaded: 0,
@@ -310,9 +316,7 @@ impl HandshakePacket {
 async fn read_from_stream(stream: &TcpStream, mut buf: &mut [u8]) -> tokio::io::Result<usize> {
     let mut size = 0;
     loop {
-        let ready = stream
-            .ready(Interest::READABLE | Interest::WRITABLE)
-            .await?;
+        let ready = stream.ready(Interest::READABLE).await?;
 
         if !ready.is_readable() {
             continue;
@@ -364,18 +368,16 @@ async fn write_to_stream(stream: &mut TcpStream, buf: &[u8]) -> anyhow::Result<(
 pub async fn do_handshake(
     info_hash: &[u8],
     addr: SocketAddr,
+    my_peer_id: [u8; 20],
 ) -> anyhow::Result<(TcpStream, HandshakePacket)> {
-    let handshake = HandshakePacket::new(
-        info_hash.try_into().unwrap(),
-        random_peer_id().as_bytes().try_into().unwrap(),
-    );
-
-    let buf = handshake.to_slice();
-    let mut buf_in = [0; std::mem::size_of::<HandshakePacket>()];
+    let handshake = HandshakePacket::new(info_hash.try_into().unwrap(), my_peer_id);
 
     let mut stream = tokio::net::TcpStream::connect(addr)
         .await
         .context("able to create TCP connection to peer during the handshake")?;
+
+    let buf = handshake.to_slice();
+    let mut buf_in = [0; std::mem::size_of::<HandshakePacket>()];
 
     write_to_stream(&mut stream, buf)
         .await
@@ -435,16 +437,18 @@ async fn read_peer_message(stream: &TcpStream) -> anyhow::Result<Vec<u8>> {
 pub async fn create_peer_connect(
     torrent: &TorrentInfo,
     peer: SocketAddr,
+    my_peer_id: [u8; 20],
 ) -> anyhow::Result<(tokio::net::TcpStream, Vec<u8>)> {
     // 3) Establish a TCP connection with a peer, and perform a handshake
-    eprintln!("handshake for peer 0");
-    let (stream, _handshake_response) = do_handshake(&torrent.hash_raw(), peer)
+    eprintln!("starting the handshake for peer <{peer}>");
+
+    let (stream, _handshake_response) = do_handshake(&torrent.hash_raw(), peer, my_peer_id)
         .await
         .context("while handshake")?;
 
     // 4) Exchange multiple peer messages to download the file
     // 4.1) Wait for a bitfield message from the peer indicating which pieces it has
-    eprintln!("waiting for bitfield of peer");
+    eprintln!("waiting for bitfield of peer <{peer}>");
     let bf = wait_for_bitfield(&stream)
         .await
         .context("waiting for bitfield")?;
