@@ -6,15 +6,17 @@ use std::{
 };
 
 use anyhow::Context;
-use bytes::{Buf as _, BufMut};
 use rand::distr::{Alphanumeric, SampleString};
 use serde::Serialize;
 use sha1::Digest as _;
 use tokio::{io::Interest, net::TcpStream};
 
-use crate::bencode;
+use crate::{
+    bencode,
+    message::{self, Message},
+};
 
-pub fn digest_to_str(digest: &[u8]) -> String {
+pub fn digest_to_str(digest: Sha1Hash) -> String {
     let mut f = String::with_capacity(40);
     for d in digest {
         let _ = write!(&mut f, "{:0>2x}", d);
@@ -91,11 +93,14 @@ impl TryFrom<bencode::Value> for TorrentFile {
     }
 }
 
-pub fn sha1(buf: &[u8]) -> Vec<u8> {
+pub fn sha1(buf: &[u8]) -> Sha1Hash {
     let mut hasher = sha1::Sha1::default();
     hasher.update(buf);
     let digest = hasher.finalize();
-    digest.as_slice().to_vec()
+    digest
+        .as_slice()
+        .try_into()
+        .expect("SHA1 should always be the same len")
 }
 
 #[derive(Debug, Clone)]
@@ -110,10 +115,10 @@ pub struct TorrentInfo {
 impl TorrentInfo {
     pub fn hash(&self) -> String {
         let digest = sha1(&bencode::encode(&self.value));
-        digest_to_str(digest.as_slice())
+        digest_to_str(digest)
     }
 
-    pub fn hash_raw(&self) -> Vec<u8> {
+    pub fn hash_raw(&self) -> Sha1Hash {
         sha1(&bencode::encode(&self.value))
     }
 }
@@ -301,7 +306,7 @@ impl HandshakePacket {
     fn new(info_hash: [u8; 20], peer_id: [u8; 20]) -> Self {
         Self {
             length: 19,
-            protocol_string: "BitTorrent protocol".as_bytes().try_into().unwrap(),
+            protocol_string: *b"BitTorrent protocol",
             _reserved: HANDSHAKE_RESERVED,
             info_hash,
             peer_id,
@@ -328,6 +333,7 @@ async fn read_from_stream(stream: &TcpStream, mut buf: &mut [u8]) -> anyhow::Res
         if !ready.is_readable() {
             continue;
         }
+
         match stream.try_read(buf) {
             Ok(0) => break Ok(0),
             Ok(n) => {
@@ -346,7 +352,7 @@ async fn read_from_stream(stream: &TcpStream, mut buf: &mut [u8]) -> anyhow::Res
     }
 }
 
-async fn write_to_stream(stream: &mut TcpStream, buf: &[u8]) -> anyhow::Result<()> {
+async fn write_to_stream(stream: &TcpStream, buf: &[u8]) -> anyhow::Result<()> {
     let mut written = 0;
     loop {
         let ready = stream
@@ -357,6 +363,7 @@ async fn write_to_stream(stream: &mut TcpStream, buf: &[u8]) -> anyhow::Result<(
         if !ready.is_writable() {
             continue;
         }
+
         match stream.try_write(&buf[written..]) {
             Ok(n) => {
                 written += n;
@@ -373,20 +380,20 @@ async fn write_to_stream(stream: &mut TcpStream, buf: &[u8]) -> anyhow::Result<(
 }
 
 pub async fn do_handshake(
-    info_hash: &[u8],
+    info_hash: Sha1Hash,
     addr: SocketAddr,
-    my_peer_id: [u8; 20],
+    my_peer_id: Sha1Hash,
 ) -> anyhow::Result<(TcpStream, HandshakePacket)> {
-    let handshake = HandshakePacket::new(info_hash.try_into().unwrap(), my_peer_id);
+    let handshake = HandshakePacket::new(info_hash, my_peer_id);
 
-    let mut stream = tokio::net::TcpStream::connect(addr)
+    let stream = tokio::net::TcpStream::connect(addr)
         .await
         .context("able to create TCP connection to peer during the handshake")?;
 
     let buf = handshake.to_slice();
     let mut buf_in = [0; std::mem::size_of::<HandshakePacket>()];
 
-    write_to_stream(&mut stream, buf)
+    write_to_stream(&stream, buf)
         .await
         .context("able to write to stream duirng the handshake")?;
 
@@ -399,11 +406,57 @@ pub async fn do_handshake(
     Ok((stream, HandshakePacket::from_slice(&buf_in).clone()))
 }
 
+const UT_METADATA_ID: i64 = 42;
+
+fn create_extension_handshake() -> Vec<u8> {
+    let mut buf = Vec::with_capacity(100);
+
+    let extention_id = [("ut_metadata".to_string(), UT_METADATA_ID)].into();
+    let msg = Message::Extension(message::Extension { extention_id });
+
+    msg.write(&mut buf);
+
+    buf
+}
+
+async fn handle_extention_handshake(stream: &TcpStream) -> anyhow::Result<i64> {
+    let cm = create_extension_handshake();
+    write_to_stream(stream, &cm).await?;
+
+    let msg = read_peer_message(stream).await?;
+    let msg = Message::read(&msg);
+    match msg {
+        Message::Extension(extension) => Ok(extension.extention_id["ut_metadata"]),
+        _ => Err(anyhow::anyhow!("Invalid extention handshake format")),
+    }
+}
+
+pub async fn magnet_create_peer_connect(
+    info_hash: Sha1Hash,
+    addr: SocketAddr,
+    my_peer_id: Sha1Hash,
+) -> anyhow::Result<(TcpStream, HandshakePacket, i64)> {
+    let (tcp, _bit_field, handshake) = create_peer_connect(info_hash, addr, my_peer_id).await?;
+
+    let t = handshake
+        ._reserved
+        .iter()
+        .zip(HANDSHAKE_RESERVED)
+        .all(|(r, e)| (r & e) == e);
+
+    assert!(t, "peer does not support the magnet extention");
+
+    let id = handle_extention_handshake(&tcp).await?;
+
+    Ok((tcp, handshake, id))
+}
+
+const LENGHT_PREFIX: usize = 4;
+
 async fn read_peer_message(stream: &TcpStream) -> anyhow::Result<Vec<u8>> {
     // Peer messages consist of a message length prefix (4 bytes), message id (1 byte) and a payload (variable size).
     // we are going to load everything upto the payload size in the first run and after that the
     // payload behind it
-    const LENGHT_PREFIX: usize = 4;
 
     // read message length + message id
     let mut buf = vec![0; LENGHT_PREFIX];
@@ -442,14 +495,14 @@ async fn read_peer_message(stream: &TcpStream) -> anyhow::Result<Vec<u8>> {
 }
 
 pub async fn create_peer_connect(
-    torrent: &TorrentInfo,
+    torrent: Sha1Hash,
     peer: SocketAddr,
-    my_peer_id: [u8; 20],
-) -> anyhow::Result<(tokio::net::TcpStream, Vec<u8>)> {
+    my_peer_id: Sha1Hash,
+) -> anyhow::Result<(tokio::net::TcpStream, Vec<u8>, HandshakePacket)> {
     // 3) Establish a TCP connection with a peer, and perform a handshake
     eprintln!("starting the handshake for peer <{peer}>");
 
-    let (stream, _handshake_response) = do_handshake(&torrent.hash_raw(), peer, my_peer_id)
+    let (stream, handshake_response) = do_handshake(torrent, peer, my_peer_id)
         .await
         .context("while handshake")?;
 
@@ -460,7 +513,7 @@ pub async fn create_peer_connect(
         .await
         .context("waiting for bitfield")?;
 
-    Ok((stream, bf))
+    Ok((stream, bf, handshake_response))
 }
 
 // The first byte of the bitfield corresponds to indices 0 - 7 from high bit to low bit,
@@ -470,13 +523,17 @@ pub async fn wait_for_bitfield(stream: &TcpStream) -> anyhow::Result<Vec<u8>> {
         .await
         .context("reading bitfield message")?;
 
-    assert_eq!(bitfield_buf[4], 5);
+    let msg = Message::read(&bitfield_buf);
+
+    assert!(matches!(msg, Message::BitField(_)));
 
     Ok(bitfield_buf[5..].to_vec())
 }
 
 pub async fn send_interested(stream: &mut TcpStream) -> anyhow::Result<()> {
-    let buf = [0, 0, 0, 1, 2];
+    let mut buf = vec![];
+    Message::Interested.write(&mut buf);
+
     write_to_stream(stream, &buf)
         .await
         .context("while writing to stream")?;
@@ -496,23 +553,17 @@ pub async fn send_request_message(
     offset: usize,
     length: usize,
 ) -> anyhow::Result<()> {
-    // we can use BytesMut while using a constant buffer :)
-    const SIZE: usize = 4 + 1 + 4 + 4 + 4;
-    let mut mbuf = [0; SIZE];
-    let mut buf = &mut mbuf[..];
+    let mut buf = Vec::with_capacity(100);
 
-    // message length prefix (4 bytes)
-    buf.put_u32(SIZE as _);
-    // The message id for request is 6
-    buf.put_u8(6);
-    // index: the zero-based piece index
-    buf.put_u32(piece_nr as _);
-    // begin: the zero-based byte offset within the piece
-    buf.put_u32(offset as _);
-    // length: the length of the block in bytes
-    buf.put_u32(length as _);
+    let msg = message::Message::Request(message::Request {
+        index: piece_nr as _,
+        offset: offset as _,
+        length: length as _,
+    });
 
-    write_to_stream(stream, &mbuf)
+    msg.write(&mut buf);
+
+    write_to_stream(stream, &buf)
         .await
         .context("writing to stream during a request message")?;
     Ok(())
@@ -542,39 +593,25 @@ pub async fn download_piece(
         } else {
             piece_length - offset
         };
-        // eprintln!(
-        //     "downloading {} -- {} -- {}",
-        //     piece_nr,
-        //     offset,
-        //     length + offset
-        // );
+
         send_request_message(stream, piece_nr, offset, length).await?;
+
         // 4.6) Wait for a piece message for each block you've requested
         let block = wait_for_piece(stream).await?;
 
-        let mut b = &block[..];
-        let _l_msg_len = b.get_u32();
-        let l_id = b.get_u8();
-        let l_piece = b.get_u32();
-        let l_offset = b.get_u32();
-
-        assert_eq!(l_id, 7);
-        assert_eq!(l_piece as usize, piece_nr);
-        assert_eq!(l_piece as usize, piece_nr);
-        assert_eq!(l_offset as usize, offset);
-
         // 5) Combine all loaded pieces,
-        let f = &block[5 + 8..];
-        assert_eq!(
-            f.len(),
-            length,
-            "foo {} -- {} -- {} -- {:?}",
-            f.len(),
-            length,
-            step,
-            block
-        );
-        storage.extend_from_slice(f);
+        let msg = message::Message::read(&block);
+
+        let piece = if let message::Message::Piece(piece) = msg {
+            piece
+        } else {
+            panic!("not expected message type received");
+        };
+
+        assert_eq!(piece.index as usize, piece_nr);
+        assert_eq!(piece.offset as usize, offset);
+
+        storage.extend_from_slice(&piece.piece);
     }
     // 6) Check the integrity of each piece by comparing it's hash with the piece hash value found in the torrent file.
     let digest = sha1(&storage);

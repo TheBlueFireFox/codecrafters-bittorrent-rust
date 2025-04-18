@@ -1,4 +1,5 @@
 mod bencode;
+mod message;
 mod torrent;
 
 use std::{
@@ -105,7 +106,8 @@ fn info(path: impl AsRef<Path>) {
         .info
         .pieces
         .iter()
-        .map(|v| torrent::digest_to_str(v))
+        .copied()
+        .map(torrent::digest_to_str)
         .collect();
     let pieces = pieces.join("\n");
 
@@ -125,11 +127,7 @@ async fn peers(path: impl AsRef<Path>, my_peer_id: [u8; 20]) -> anyhow::Result<(
     let torrent = torrent::torrent_file(path).await?;
     let tracker = torrent::peers_load(
         &torrent.announce,
-        torrent
-            .info
-            .hash_raw()
-            .try_into()
-            .expect("incorrect hash len"),
+        torrent.info.hash_raw(),
         torrent.info.length,
         my_peer_id,
     )
@@ -144,13 +142,13 @@ async fn peers(path: impl AsRef<Path>, my_peer_id: [u8; 20]) -> anyhow::Result<(
 async fn handshake(
     path: impl AsRef<Path>,
     addr: SocketAddr,
-    my_peer_id: [u8; 20],
+    my_peer_id: Sha1Hash,
 ) -> anyhow::Result<()> {
     let torrent = torrent::torrent_file(path).await?;
     let info_hash = torrent.info.hash_raw();
-    let (_, res) = torrent::do_handshake(&info_hash, addr, my_peer_id).await?;
+    let (_, res) = torrent::do_handshake(info_hash, addr, my_peer_id).await?;
 
-    println!("Peer ID: {}", digest_to_str(&res.peer_id));
+    println!("Peer ID: {}", digest_to_str(res.peer_id));
 
     Ok(())
 }
@@ -161,7 +159,7 @@ async fn magnet_parse(link: &str) -> anyhow::Result<()> {
     println!(
         "Tracker URL: {}\nInfo Hash: {}",
         link.tracker,
-        digest_to_str(&link.hash)
+        digest_to_str(link.hash)
     );
 
     Ok(())
@@ -181,9 +179,13 @@ async fn magnet_handshake(link: &str, my_peer_id: [u8; 20]) -> anyhow::Result<()
     // random one
     let peer = tracker.peers[0];
 
-    let (_, res) = torrent::do_handshake(&link.hash, peer, my_peer_id).await?;
+    let (_, res, ext_id) = torrent::magnet_create_peer_connect(link.hash, peer, my_peer_id).await?;
 
-    println!("Peer ID: {}", digest_to_str(&res.peer_id));
+    println!(
+        "Peer ID: {}\nPeer Metadata Extension ID: {}",
+        digest_to_str(res.peer_id),
+        ext_id
+    );
 
     Ok(())
 }
@@ -207,11 +209,7 @@ async fn download_piece(
     eprintln!("loading peers");
     let tracker = torrent::peers_load(
         &torrent.announce,
-        torrent
-            .info
-            .hash_raw()
-            .try_into()
-            .expect("incorrect hash len"),
+        torrent.info.hash_raw(),
         torrent.info.length,
         my_peer_id,
     )
@@ -223,7 +221,7 @@ async fn download_piece(
     let mut s = None;
     for peer in tracker.peers {
         eprintln!("using peer nr {}", peer);
-        match torrent::create_peer_connect(&torrent.info, peer, my_peer_id)
+        match torrent::create_peer_connect(torrent.info.hash_raw(), peer, my_peer_id)
             .await
             .context("while creating a peer connection during a downlaod")
         {
@@ -237,7 +235,7 @@ async fn download_piece(
         }
     }
 
-    let (mut stream, _bf) = s.unwrap()?;
+    let (mut stream, _bf, _) = s.unwrap()?;
 
     // 4.2) Send an interested message
     eprintln!("sending interested packet");
@@ -321,7 +319,7 @@ async fn handle_peer(
 
     for i in 0..MAX_TRY {
         eprintln!("trying to connect to peer <{peer}> try <{i}>");
-        match torrent::create_peer_connect(&torrent_info, peer, my_peer_id).await {
+        match torrent::create_peer_connect(torrent_info.hash_raw(), peer, my_peer_id).await {
             Ok(e) => {
                 s = Some(e);
                 eprintln!("connection to peer {peer} successful");
@@ -334,7 +332,7 @@ async fn handle_peer(
 
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
-    let (mut stream, _) = match s {
+    let (mut stream, _, _) = match s {
         Some(s) => s,
         None => {
             eprintln!("given up in {}", peer);
@@ -394,11 +392,7 @@ async fn download(
 
     let tracker = torrent::peers_load(
         &torrent.announce,
-        torrent
-            .info
-            .hash_raw()
-            .try_into()
-            .expect("incorrect hash len"),
+        torrent.info.hash_raw(),
         torrent.info.length,
         my_peer_id,
     )
@@ -455,14 +449,19 @@ async fn download(
 
     let mut map = HashMap::new();
     let mut needed = 0;
+    let mut loaded = 0;
     while needed < piece_count {
-        eprintln!("waiting for a piece {} of {piece_count}", needed + 1);
+        eprintln!(
+            "waiting for a piece {} of {} -- head at {}",
+            loaded + 1,
+            piece_count,
+            needed + 1
+        );
 
         match recv_res.recv().await {
             Some((piece, section)) => {
-                eprintln!("got piece");
-
                 map.insert(piece.nr, section);
+                loaded += 1;
             }
             None => {
                 eprintln!("unexpected error while wating to piece");
