@@ -29,6 +29,7 @@ enum Commands {
     Peers(Peers),
     Handshake(Handshake),
     MagnetParse(MagnetParse),
+    MagnetHandshake(MagnetHandshake),
     DownloadPiece(DownloadPiece),
     Download(Download),
 }
@@ -60,6 +61,12 @@ struct Peers {
 
 #[derive(clap::Args, Debug)]
 struct MagnetParse {
+    str: String,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct MagnetHandshake {
+    /// The path to read from
     str: String,
 }
 
@@ -116,7 +123,17 @@ Piece Hashes:
 
 async fn peers(path: impl AsRef<Path>, my_peer_id: [u8; 20]) -> anyhow::Result<()> {
     let torrent = torrent::torrent_file(path).await?;
-    let tracker = torrent::peers_load(&torrent, my_peer_id).await?;
+    let tracker = torrent::peers_load(
+        &torrent.announce,
+        torrent
+            .info
+            .hash_raw()
+            .try_into()
+            .expect("incorrect hash len"),
+        torrent.info.length,
+        my_peer_id,
+    )
+    .await?;
     for peer in tracker.peers {
         println!("{}", peer);
     }
@@ -133,10 +150,7 @@ async fn handshake(
     let info_hash = torrent.info.hash_raw();
     let (_, res) = torrent::do_handshake(&info_hash, addr, my_peer_id).await?;
 
-    println!(
-        "Peer ID: {}",
-        res.peer_id.map(|c| format!("{:0>2x}", c)).join("")
-    );
+    println!("Peer ID: {}", digest_to_str(&res.peer_id));
 
     Ok(())
 }
@@ -149,6 +163,27 @@ async fn magnet_parse(link: &str) -> anyhow::Result<()> {
         link.tracker,
         digest_to_str(&link.hash)
     );
+
+    Ok(())
+}
+
+async fn magnet_handshake(link: &str, my_peer_id: [u8; 20]) -> anyhow::Result<()> {
+    let link = torrent::TorrentMagnet::try_from(link).map_err(|e| anyhow!("{e}"))?;
+
+    let tracker = torrent::peers_load(
+        &link.tracker,
+        link.hash,
+        999, // random value as the "left" (lenght) value is required by the tracker
+        my_peer_id,
+    )
+    .await?;
+
+    // random one
+    let peer = tracker.peers[0];
+
+    let (_, res) = torrent::do_handshake(&link.hash, peer, my_peer_id).await?;
+
+    println!("Peer ID: {}", digest_to_str(&res.peer_id));
 
     Ok(())
 }
@@ -170,7 +205,17 @@ async fn download_piece(
 
     // 2) Perform the tracker GET request to get a list of peers
     eprintln!("loading peers");
-    let tracker = torrent::peers_load(&torrent, my_peer_id).await?;
+    let tracker = torrent::peers_load(
+        &torrent.announce,
+        torrent
+            .info
+            .hash_raw()
+            .try_into()
+            .expect("incorrect hash len"),
+        torrent.info.length,
+        my_peer_id,
+    )
+    .await?;
 
     // 3) Establish a TCP connection with a peer, and perform a handshake
     // 4) Exchange multiple peer messages to download the file
@@ -346,7 +391,18 @@ async fn download(
 
     // 2) Perform the tracker GET request to get a list of peers
     eprintln!("loading peers");
-    let tracker = torrent::peers_load(&torrent, my_peer_id).await?;
+
+    let tracker = torrent::peers_load(
+        &torrent.announce,
+        torrent
+            .info
+            .hash_raw()
+            .try_into()
+            .expect("incorrect hash len"),
+        torrent.info.length,
+        my_peer_id,
+    )
+    .await?;
 
     let piece_count = torrent.info.pieces.len();
 
@@ -447,6 +503,7 @@ async fn main() -> anyhow::Result<()> {
             download(out_path, path, my_peer_id).await?
         }
         Commands::MagnetParse(mp) => magnet_parse(&mp.str).await?,
+        Commands::MagnetHandshake(mh) => magnet_handshake(&mh.str, my_peer_id).await?,
     }
 
     Ok(())

@@ -237,23 +237,24 @@ pub fn random_peer_id() -> [u8; 20] {
 }
 
 pub async fn peers_load(
-    torrent: &TorrentFile,
-    my_peer_id: [u8; 20],
+    tracker_url: &str,
+    tracker_hash: Sha1Hash,
+    size: usize,
+    my_peer_id: Sha1Hash,
 ) -> anyhow::Result<TrackerResponse> {
     let params = QueryParams {
-        info_hash: torrent.info.hash_raw(),
+        info_hash: tracker_hash.to_vec(),
         peer_id: String::from_utf8(my_peer_id.to_vec())?,
         port: 6881,
         uploaded: 0,
         downloaded: 0,
-        left: torrent.info.length,
+        left: size,
         compact: true,
     };
-    let url = &torrent.announce;
     let ih = params.hash_info_hash();
     let url = format!(
         "{}?{}&info_hash={}",
-        url,
+        tracker_url,
         serde_urlencoded::to_string(params).context("able to convert to url encoding")?,
         ih
     );
@@ -293,12 +294,15 @@ pub struct HandshakePacket {
     pub peer_id: [u8; 20],
 }
 
+// Extension handshake a client must set the 20th bit from the right
+const HANDSHAKE_RESERVED: [u8; 8] = [0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00];
+
 impl HandshakePacket {
     fn new(info_hash: [u8; 20], peer_id: [u8; 20]) -> Self {
         Self {
             length: 19,
             protocol_string: "BitTorrent protocol".as_bytes().try_into().unwrap(),
-            _reserved: [0; 8],
+            _reserved: HANDSHAKE_RESERVED,
             info_hash,
             peer_id,
         }
@@ -313,10 +317,13 @@ impl HandshakePacket {
     }
 }
 
-async fn read_from_stream(stream: &TcpStream, mut buf: &mut [u8]) -> tokio::io::Result<usize> {
+async fn read_from_stream(stream: &TcpStream, mut buf: &mut [u8]) -> anyhow::Result<usize> {
     let mut size = 0;
     loop {
-        let ready = stream.ready(Interest::READABLE).await?;
+        let ready = stream
+            .ready(Interest::READABLE)
+            .await
+            .context("while waiting for readable")?;
 
         if !ready.is_readable() {
             continue;
@@ -334,7 +341,7 @@ async fn read_from_stream(stream: &TcpStream, mut buf: &mut [u8]) -> tokio::io::
             Err(ref e) if e.kind() == tokio::io::ErrorKind::WouldBlock => {
                 continue;
             }
-            Err(err) => break Err(err),
+            Err(err) => break Err(err).context("while trying to read from the wire")?,
         }
     }
 }
