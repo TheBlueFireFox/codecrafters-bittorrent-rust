@@ -12,7 +12,9 @@ use std::{
 use anyhow::{anyhow, Context};
 use clap::Parser;
 use tokio::io::AsyncWriteExt;
-use torrent::{digest_to_str, random_peer_id, Sha1Hash};
+use torrent::{
+    digest_to_str, random_peer_id, HandshakePacket, Sha1Hash, TorrentInfo, TrackerResponse,
+};
 
 /// Simple program to greet a person
 #[derive(clap::Parser, Debug)]
@@ -35,6 +37,7 @@ enum Commands {
     MagnetHandshake(MagnetHandshake),
     MagnetInfo(MagnetInfo),
     MagnetDownloadPiece(MagnetDownloadPiece),
+    MagnetDownload(MagnetDownload),
 }
 
 #[derive(clap::Args, Debug)]
@@ -103,6 +106,14 @@ pub struct MagnetDownloadPiece {
     piece: usize,
 }
 
+#[derive(clap::Args, Debug)]
+struct MagnetDownload {
+    #[clap(short = 'o', long = "to", default_value = ".")]
+    out_path: std::path::PathBuf,
+    /// The path to read from
+    link: String,
+}
+
 fn decode(bencode: &[u8]) {
     let (s, _) = bencode::decode(bencode);
     println!("{}", bencode::format_helper(&s));
@@ -161,7 +172,8 @@ async fn handshake(
 ) -> anyhow::Result<()> {
     let torrent = torrent::torrent_file(path).await?;
     let info_hash = torrent.info.hash_raw();
-    let (_, res) = torrent::do_handshake(info_hash, addr, my_peer_id).await?;
+    let packet = HandshakePacket::new(info_hash, my_peer_id);
+    let (_, res) = torrent::do_handshake(addr, packet).await?;
 
     println!("Peer ID: {}", digest_to_str(res.peer_id));
 
@@ -356,42 +368,28 @@ async fn handle_peer(
     Ok(())
 }
 
-async fn download(
+async fn inner_download(
     out_path: impl AsRef<Path>,
-    path: impl AsRef<Path>,
-    my_peer_id: [u8; 20],
+    tracker: &TrackerResponse,
+    torrent: &TorrentInfo,
+    my_peer_id: Sha1Hash,
 ) -> anyhow::Result<()> {
-    // 1) Read the torrent file to get the tracker URL
-    eprintln!("reading torrent file");
-    let torrent = torrent::torrent_file(&path).await?;
-
-    // 2) Perform the tracker GET request to get a list of peers
-    eprintln!("loading peers");
-
-    let tracker = torrent::peers_load(
-        &torrent.announce,
-        torrent.info.hash_raw(),
-        torrent.info.length,
-        my_peer_id,
-    )
-    .await?;
-
-    let piece_count = torrent.info.pieces.len();
+    let piece_count = torrent.pieces.len();
 
     let (send_res, mut recv_res) = tokio::sync::mpsc::channel(10);
     let mut task_queue = BinaryHeap::with_capacity(piece_count);
 
     // prepare all parts to be downloaded
-    for piece_nr in 0..torrent.info.pieces.len() {
-        let mut piece_length = torrent.info.piece_length;
-        if piece_nr == torrent.info.pieces.len() - 1 {
+    for piece_nr in 0..torrent.pieces.len() {
+        let mut piece_length = torrent.piece_length;
+        if piece_nr == torrent.pieces.len() - 1 {
             // last piece
-            piece_length = torrent.info.length % torrent.info.piece_length
+            piece_length = torrent.length % torrent.piece_length
         };
         let p = Piece {
             nr: piece_nr,
             len: piece_length,
-            hash: torrent.info.pieces[piece_nr],
+            hash: torrent.pieces[piece_nr],
         };
 
         task_queue.push(p);
@@ -399,8 +397,8 @@ async fn download(
 
     let task_queue = Arc::new(Mutex::new(task_queue));
 
-    for peer in tracker.peers {
-        let torrent_info = torrent.info.clone();
+    for peer in tracker.peers.iter().copied() {
+        let torrent_info = torrent.clone();
         let task_queue = task_queue.clone();
         let send_res = send_res.clone();
         tokio::spawn(async move {
@@ -452,6 +450,31 @@ async fn download(
             needed += 1;
         }
     }
+
+    Ok(())
+}
+
+async fn download(
+    out_path: impl AsRef<Path>,
+    path: impl AsRef<Path>,
+    my_peer_id: [u8; 20],
+) -> anyhow::Result<()> {
+    // 1) Read the torrent file to get the tracker URL
+    eprintln!("reading torrent file");
+    let torrent = torrent::torrent_file(&path).await?;
+
+    // 2) Perform the tracker GET request to get a list of peers
+    eprintln!("loading peers");
+
+    let tracker = torrent::peers_load(
+        &torrent.announce,
+        torrent.info.hash_raw(),
+        torrent.info.length,
+        my_peer_id,
+    )
+    .await?;
+
+    inner_download(&out_path, &tracker, &torrent.info, my_peer_id).await?;
 
     println!(
         "Downloaded {} to {}.",
@@ -608,6 +631,37 @@ async fn magnet_download_piece(
     Ok(())
 }
 
+async fn magnet_download(
+    out_path: impl AsRef<Path>,
+    link: &str,
+    my_peer_id: Sha1Hash,
+) -> anyhow::Result<()> {
+    let link = torrent::TorrentMagnet::try_from(link).map_err(|e| anyhow!("{e}"))?;
+
+    let tracker = torrent::peers_load(
+        &link.tracker,
+        link.hash,
+        999, // random value as the "left" (lenght) value is required by the tracker
+        my_peer_id,
+    )
+    .await?;
+
+    // random one
+    let peer = tracker.peers[0];
+
+    let (stream, _res, ext_id) =
+        torrent::magnet_create_peer_connect(link.hash, peer, my_peer_id).await?;
+    // we only use pice 0 here as that meta data contains all the block we require
+    let torrent = torrent::magnet_load_meta_data(&stream, ext_id, 0).await?;
+    drop(stream);
+
+    inner_download(&out_path, &tracker, &torrent, my_peer_id).await?;
+
+    println!("Downloaded magnet to {}.", out_path.as_ref().display());
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -631,6 +685,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::MagnetDownloadPiece(mdp) => {
             magnet_download_piece(mdp.out_path, &mdp.link, mdp.piece, my_peer_id).await?
         }
+        Commands::MagnetDownload(md) => magnet_download(md.out_path, &md.link, my_peer_id).await?,
     }
 
     Ok(())

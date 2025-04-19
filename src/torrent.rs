@@ -304,7 +304,17 @@ pub struct HandshakePacket {
 const HANDSHAKE_RESERVED: [u8; 8] = [0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00];
 
 impl HandshakePacket {
-    fn new(info_hash: [u8; 20], peer_id: [u8; 20]) -> Self {
+    pub fn new(info_hash: Sha1Hash, peer_id: Sha1Hash) -> Self {
+        Self {
+            length: 19,
+            protocol_string: *b"BitTorrent protocol",
+            _reserved: [0; 8],
+            info_hash,
+            peer_id,
+        }
+    }
+
+    pub fn new_extension(info_hash: Sha1Hash, peer_id: Sha1Hash) -> Self {
         Self {
             length: 19,
             protocol_string: *b"BitTorrent protocol",
@@ -381,17 +391,14 @@ async fn write_to_stream(stream: &TcpStream, buf: &[u8]) -> anyhow::Result<()> {
 }
 
 pub async fn do_handshake(
-    info_hash: Sha1Hash,
     addr: SocketAddr,
-    my_peer_id: Sha1Hash,
+    packet: HandshakePacket,
 ) -> anyhow::Result<(TcpStream, HandshakePacket)> {
-    let handshake = HandshakePacket::new(info_hash, my_peer_id);
-
     let stream = tokio::net::TcpStream::connect(addr)
         .await
         .context("able to create TCP connection to peer during the handshake")?;
 
-    let buf = handshake.to_slice();
+    let buf = packet.to_slice();
     let mut buf_in = [0; std::mem::size_of::<HandshakePacket>()];
 
     write_to_stream(&stream, buf)
@@ -441,7 +448,8 @@ pub async fn magnet_create_peer_connect(
     addr: SocketAddr,
     my_peer_id: Sha1Hash,
 ) -> anyhow::Result<(TcpStream, HandshakePacket, u8)> {
-    let (tcp, _bit_field, handshake) = create_peer_connect(info_hash, addr, my_peer_id).await?;
+    let (tcp, _bit_field, handshake) =
+        create_peer_connect_extension(info_hash, addr, my_peer_id).await?;
 
     let t = handshake
         ._reserved
@@ -525,15 +533,14 @@ async fn read_peer_message(stream: &TcpStream) -> anyhow::Result<Vec<u8>> {
     Ok(buf)
 }
 
-pub async fn create_peer_connect(
-    torrent: Sha1Hash,
+async fn inner_create_peer_connect(
     peer: SocketAddr,
-    my_peer_id: Sha1Hash,
+    packet: HandshakePacket,
 ) -> anyhow::Result<(tokio::net::TcpStream, Vec<u8>, HandshakePacket)> {
     // 3) Establish a TCP connection with a peer, and perform a handshake
     eprintln!("starting the handshake for peer <{peer}>");
 
-    let (stream, handshake_response) = do_handshake(torrent, peer, my_peer_id)
+    let (stream, handshake_response) = do_handshake(peer, packet)
         .await
         .context("while handshake")?;
 
@@ -545,6 +552,24 @@ pub async fn create_peer_connect(
         .context("waiting for bitfield")?;
 
     Ok((stream, bf, handshake_response))
+}
+
+pub async fn create_peer_connect(
+    torrent: Sha1Hash,
+    peer: SocketAddr,
+    my_peer_id: Sha1Hash,
+) -> anyhow::Result<(tokio::net::TcpStream, Vec<u8>, HandshakePacket)> {
+    let packet = HandshakePacket::new(torrent, my_peer_id);
+    inner_create_peer_connect(peer, packet).await
+}
+
+pub async fn create_peer_connect_extension(
+    torrent: Sha1Hash,
+    peer: SocketAddr,
+    my_peer_id: Sha1Hash,
+) -> anyhow::Result<(tokio::net::TcpStream, Vec<u8>, HandshakePacket)> {
+    let packet = HandshakePacket::new_extension(torrent, my_peer_id);
+    inner_create_peer_connect(peer, packet).await
 }
 
 // The first byte of the bitfield corresponds to indices 0 - 7 from high bit to low bit,
@@ -574,7 +599,13 @@ pub async fn send_interested(stream: &TcpStream) -> anyhow::Result<()> {
 pub async fn wait_for_unchoke(stream: &TcpStream) -> anyhow::Result<()> {
     let unchoke = read_peer_message(stream).await?;
 
-    assert_eq!(unchoke[4], 1);
+    let msg = Message::read(&unchoke);
+
+    assert!(
+        matches!(msg, Message::Unchoke),
+        "unexpected unchoke type {:?}",
+        msg
+    );
     Ok(())
 }
 
