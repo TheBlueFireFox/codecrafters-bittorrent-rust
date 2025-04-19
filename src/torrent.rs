@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use std::{
     collections::HashMap,
     fmt::Write,
@@ -412,21 +413,25 @@ fn create_extension_handshake() -> Vec<u8> {
     let mut buf = Vec::with_capacity(100);
 
     let extention_id = [("ut_metadata".to_string(), UT_METADATA_ID)].into();
-    let msg = Message::Extension(message::Extension { extention_id });
+    let msg = Message::Extension(message::Extension::Handshake(message::ExtensionHandshake {
+        extention_id,
+    }));
 
     msg.write(&mut buf);
 
     buf
 }
 
-async fn handle_extention_handshake(stream: &TcpStream) -> anyhow::Result<i64> {
+async fn handle_extention_handshake(stream: &TcpStream) -> anyhow::Result<u8> {
     let cm = create_extension_handshake();
     write_to_stream(stream, &cm).await?;
 
     let msg = read_peer_message(stream).await?;
     let msg = Message::read(&msg);
     match msg {
-        Message::Extension(extension) => Ok(extension.extention_id["ut_metadata"]),
+        Message::Extension(message::Extension::Handshake(e)) => {
+            Ok(e.extention_id["ut_metadata"] as _)
+        }
         _ => Err(anyhow::anyhow!("Invalid extention handshake format")),
     }
 }
@@ -435,7 +440,7 @@ pub async fn magnet_create_peer_connect(
     info_hash: Sha1Hash,
     addr: SocketAddr,
     my_peer_id: Sha1Hash,
-) -> anyhow::Result<(TcpStream, HandshakePacket, i64)> {
+) -> anyhow::Result<(TcpStream, HandshakePacket, u8)> {
     let (tcp, _bit_field, handshake) = create_peer_connect(info_hash, addr, my_peer_id).await?;
 
     let t = handshake
@@ -449,6 +454,32 @@ pub async fn magnet_create_peer_connect(
     let id = handle_extention_handshake(&tcp).await?;
 
     Ok((tcp, handshake, id))
+}
+
+pub async fn magnet_load_meta_data(
+    stream: &TcpStream,
+    ext_id_peer: u8,
+    piece: i64,
+) -> anyhow::Result<TorrentInfo> {
+    use message::*;
+    let req = message::ExtensionMetadata::Request { piece };
+    let req = Extension::Extention(ext_id_peer, req);
+    let req = Message::Extension(req);
+
+    let mut buf = vec![];
+    req.write(&mut buf);
+
+    write_to_stream(stream, &buf).await?;
+
+    let buf = read_peer_message(stream).await?;
+
+    let msg = Message::read(&buf);
+    match msg {
+        Message::Extension(Extension::Extention(_, ExtensionMetadata::Data { torrent })) => {
+            Ok(torrent)
+        }
+        _ => Err(anyhow::anyhow!("Unsupported msg type")),
+    }
 }
 
 const LENGHT_PREFIX: usize = 4;

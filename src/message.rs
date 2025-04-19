@@ -1,8 +1,9 @@
+#![allow(dead_code)]
 use std::collections::BTreeMap;
 
 use bytes::{Buf, BufMut};
 
-use crate::bencode;
+use crate::{bencode, torrent::TorrentInfo};
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -24,6 +25,8 @@ impl Message {
         let length = buf.get_u32();
 
         let mut buf = (buf as &mut dyn Buf).take(length as usize);
+        assert_eq!(len, length as usize + 4);
+
         let m_type = buf.get_u8();
 
         let r = match m_type {
@@ -170,13 +173,41 @@ impl Piece {
     }
 }
 
-
 #[derive(Debug, Clone)]
-pub struct Extension {
-    pub extention_id: BTreeMap<String, i64>,
+pub enum Extension {
+    Handshake(ExtensionHandshake),
+    Extention(u8, ExtensionMetadata),
 }
 
 impl Extension {
+    fn write(&self, buf: &mut dyn bytes::BufMut) {
+        match self {
+            Extension::Handshake(extension_request) => {
+                buf.put_u8(0x00);
+                extension_request.write(buf);
+            }
+            Extension::Extention(id, req) => {
+                buf.put_u8(*id);
+                req.write(buf);
+            }
+        }
+    }
+
+    fn read(buf: &mut dyn Buf) -> Self {
+        let msg_id = buf.get_u8();
+        match msg_id {
+            0x00 => Extension::Handshake(ExtensionHandshake::read(buf)),
+            id => Extension::Extention(id, ExtensionMetadata::read(buf)),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ExtensionHandshake {
+    pub extention_id: BTreeMap<String, i64>,
+}
+
+impl ExtensionHandshake {
     fn write(&self, buf: &mut dyn bytes::BufMut) {
         let mut inner = bencode::Mapping::new();
         for (k, v) in &self.extention_id {
@@ -189,15 +220,11 @@ impl Extension {
 
         let m = bencode::Value::Dict(m);
 
-        buf.put_u8(0);
-
         let v = bencode::encode(&m);
         buf.put_slice(&v);
     }
 
     fn read(buf: &mut dyn Buf) -> Self {
-        let extension_msg_id = buf.get_u8();
-        assert_eq!(extension_msg_id, 0);
         let (msg, _) = bencode::decode(buf.chunk());
         buf.advance(buf.remaining());
 
@@ -215,5 +242,65 @@ impl Extension {
         }
 
         panic!("Unexpected extension dictionary format");
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ExtensionMetadata {
+    Request { piece: i64 },
+    Data { torrent: TorrentInfo },
+    Reject {},
+}
+
+impl ExtensionMetadata {
+    fn write(&self, buf: &mut dyn bytes::BufMut) {
+        match self {
+            ExtensionMetadata::Request { piece } => {
+                let map = [("msg_type", 0), ("piece", *piece)]
+                    .iter()
+                    .map(|(a, b)| (a.to_string(), bencode::Value::Int(*b)))
+                    .collect();
+
+                let map = bencode::Value::Dict(map);
+                buf.put_slice(&bencode::encode(&map));
+            }
+            ExtensionMetadata::Data { torrent: _ } => {
+                unimplemented!("no support for sending the Data extension")
+            }
+            ExtensionMetadata::Reject {} => {
+                unimplemented!("no support for sending the Reject extension")
+            }
+        }
+    }
+
+    fn read(buf: &mut dyn Buf) -> Self {
+        let s = Self::read_inner(buf);
+        buf.advance(buf.remaining());
+        s
+    }
+
+    fn read_inner(buf: &mut dyn Buf) -> Self {
+        let (msg, _rest) = bencode::decode(buf.chunk());
+        match &msg {
+            bencode::Value::Dict(map) => match map["msg_type"] {
+                bencode::Value::Int(0) => {
+                    unimplemented!("Why did we get a Request Extension Metadata")
+                }
+                bencode::Value::Int(1) => {
+                    let (torrent_info, _) = bencode::decode(_rest);
+
+                    Self::Data {
+                        torrent: torrent_info.try_into().expect("should fit??"),
+                    }
+                }
+                bencode::Value::Int(2) => {
+                    unimplemented!("Why did we get a Reject Extension Metadata")
+                }
+                _ => panic!("unexpected value or type for the msg id"),
+            },
+            _ => {
+                panic!("unexpected value or type for the msg id");
+            }
+        }
     }
 }

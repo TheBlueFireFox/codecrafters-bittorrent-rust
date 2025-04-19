@@ -31,6 +31,7 @@ enum Commands {
     Handshake(Handshake),
     MagnetParse(MagnetParse),
     MagnetHandshake(MagnetHandshake),
+    MagnetInfo(MagnetInfo),
     DownloadPiece(DownloadPiece),
     Download(Download),
 }
@@ -67,7 +68,11 @@ struct MagnetParse {
 
 #[derive(clap::Args, Debug)]
 pub struct MagnetHandshake {
-    /// The path to read from
+    str: String,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct MagnetInfo {
     str: String,
 }
 
@@ -149,43 +154,6 @@ async fn handshake(
     let (_, res) = torrent::do_handshake(info_hash, addr, my_peer_id).await?;
 
     println!("Peer ID: {}", digest_to_str(res.peer_id));
-
-    Ok(())
-}
-
-async fn magnet_parse(link: &str) -> anyhow::Result<()> {
-    let link = torrent::TorrentMagnet::try_from(link).map_err(|e| anyhow!("{e}"))?;
-
-    println!(
-        "Tracker URL: {}\nInfo Hash: {}",
-        link.tracker,
-        digest_to_str(link.hash)
-    );
-
-    Ok(())
-}
-
-async fn magnet_handshake(link: &str, my_peer_id: [u8; 20]) -> anyhow::Result<()> {
-    let link = torrent::TorrentMagnet::try_from(link).map_err(|e| anyhow!("{e}"))?;
-
-    let tracker = torrent::peers_load(
-        &link.tracker,
-        link.hash,
-        999, // random value as the "left" (lenght) value is required by the tracker
-        my_peer_id,
-    )
-    .await?;
-
-    // random one
-    let peer = tracker.peers[0];
-
-    let (_, res, ext_id) = torrent::magnet_create_peer_connect(link.hash, peer, my_peer_id).await?;
-
-    println!(
-        "Peer ID: {}\nPeer Metadata Extension ID: {}",
-        digest_to_str(res.peer_id),
-        ext_id
-    );
 
     Ok(())
 }
@@ -484,6 +452,85 @@ async fn download(
     Ok(())
 }
 
+async fn magnet_parse(link: &str) -> anyhow::Result<()> {
+    let link = torrent::TorrentMagnet::try_from(link).map_err(|e| anyhow!("{e}"))?;
+
+    println!(
+        "Tracker URL: {}\nInfo Hash: {}",
+        link.tracker,
+        digest_to_str(link.hash)
+    );
+
+    Ok(())
+}
+
+async fn magnet_handshake(link: &str, my_peer_id: Sha1Hash) -> anyhow::Result<()> {
+    let link = torrent::TorrentMagnet::try_from(link).map_err(|e| anyhow!("{e}"))?;
+
+    let tracker = torrent::peers_load(
+        &link.tracker,
+        link.hash,
+        999, // random value as the "left" (lenght) value is required by the tracker
+        my_peer_id,
+    )
+    .await?;
+
+    // random one
+    let peer = tracker.peers[0];
+
+    let (_, res, ext_id) = torrent::magnet_create_peer_connect(link.hash, peer, my_peer_id).await?;
+
+    println!(
+        "Peer ID: {}\nPeer Metadata Extension ID: {}",
+        digest_to_str(res.peer_id),
+        ext_id
+    );
+
+    Ok(())
+}
+
+async fn magnet_info(link: &str, my_peer_id: Sha1Hash) -> anyhow::Result<()> {
+    let link = torrent::TorrentMagnet::try_from(link).map_err(|e| anyhow!("{e}"))?;
+
+    let tracker = torrent::peers_load(
+        &link.tracker,
+        link.hash,
+        999, // random value as the "left" (lenght) value is required by the tracker
+        my_peer_id,
+    )
+    .await?;
+
+    // random one
+    let peer = tracker.peers[0];
+
+    let (stream, _res, ext_id) =
+        torrent::magnet_create_peer_connect(link.hash, peer, my_peer_id).await?;
+    let torrent = torrent::magnet_load_meta_data(&stream, ext_id, 0).await?;
+
+    let hash = torrent.hash();
+
+    let pieces: Vec<_> = torrent
+        .pieces
+        .into_iter()
+        .map(torrent::digest_to_str)
+        .collect();
+    let pieces = pieces.join("\n");
+
+    print!(
+        r#"Tracker URL: {}
+Peer Metadata Extension ID: {}
+Length: {}
+Info Hash: {}
+Piece Length: {}
+Piece Hashes:
+{}
+"#,
+        link.tracker, ext_id, torrent.length, hash, torrent.piece_length, pieces
+    );
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -503,6 +550,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::MagnetParse(mp) => magnet_parse(&mp.str).await?,
         Commands::MagnetHandshake(mh) => magnet_handshake(&mh.str, my_peer_id).await?,
+        Commands::MagnetInfo(mi) => magnet_info(&mi.str, my_peer_id).await?,
     }
 
     Ok(())
