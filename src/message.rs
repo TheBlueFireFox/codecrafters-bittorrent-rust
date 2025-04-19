@@ -249,7 +249,7 @@ impl ExtensionHandshake {
 pub enum ExtensionMetadata {
     Request { piece: i64 },
     Data { torrent: TorrentInfo },
-    Reject {},
+    Reject { piece: i64 },
 }
 
 impl ExtensionMetadata {
@@ -267,7 +267,7 @@ impl ExtensionMetadata {
             ExtensionMetadata::Data { torrent: _ } => {
                 unimplemented!("no support for sending the Data extension")
             }
-            ExtensionMetadata::Reject {} => {
+            ExtensionMetadata::Reject { piece: _ } => {
                 unimplemented!("no support for sending the Reject extension")
             }
         }
@@ -290,12 +290,15 @@ impl ExtensionMetadata {
                     let (torrent_info, _) = bencode::decode(_rest);
 
                     Self::Data {
-                        torrent: torrent_info.try_into().expect("should fit??"),
+                        torrent: torrent_info
+                            .try_into()
+                            .expect("torrent info cannot be build from data response?"),
                     }
                 }
-                bencode::Value::Int(2) => {
-                    unimplemented!("Why did we get a Reject Extension Metadata")
-                }
+                bencode::Value::Int(2) => match map["piece"] {
+                    bencode::Value::Int(v) => Self::Reject { piece: v },
+                    _ => panic!("unexpected value or type for the piece"),
+                },
                 _ => panic!("unexpected value or type for the msg id"),
             },
             _ => {

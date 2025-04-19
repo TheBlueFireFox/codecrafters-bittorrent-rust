@@ -561,7 +561,7 @@ pub async fn wait_for_bitfield(stream: &TcpStream) -> anyhow::Result<Vec<u8>> {
     Ok(bitfield_buf[5..].to_vec())
 }
 
-pub async fn send_interested(stream: &mut TcpStream) -> anyhow::Result<()> {
+pub async fn send_interested(stream: &TcpStream) -> anyhow::Result<()> {
     let mut buf = vec![];
     Message::Interested.write(&mut buf);
 
@@ -579,7 +579,7 @@ pub async fn wait_for_unchoke(stream: &TcpStream) -> anyhow::Result<()> {
 }
 
 pub async fn send_request_message(
-    stream: &mut TcpStream,
+    stream: &TcpStream,
     piece_nr: usize,
     offset: usize,
     length: usize,
@@ -609,7 +609,7 @@ pub async fn wait_for_piece(stream: &TcpStream) -> anyhow::Result<Vec<u8>> {
 }
 
 pub async fn download_piece(
-    stream: &mut TcpStream,
+    stream: &TcpStream,
     piece_nr: usize,
     piece_length: usize,
     piece_hash: &[u8; 20],

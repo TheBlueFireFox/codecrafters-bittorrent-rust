@@ -29,11 +29,12 @@ enum Commands {
     Info(Info),
     Peers(Peers),
     Handshake(Handshake),
+    DownloadPiece(DownloadPiece),
+    Download(Download),
     MagnetParse(MagnetParse),
     MagnetHandshake(MagnetHandshake),
     MagnetInfo(MagnetInfo),
-    DownloadPiece(DownloadPiece),
-    Download(Download),
+    MagnetDownloadPiece(MagnetDownloadPiece),
 }
 
 #[derive(clap::Args, Debug)]
@@ -62,6 +63,23 @@ struct Peers {
 }
 
 #[derive(clap::Args, Debug)]
+struct DownloadPiece {
+    #[clap(short = 'o', long = "to", default_value = ".")]
+    out_path: std::path::PathBuf,
+    /// The path to read from
+    path: PathBuf,
+    piece: usize,
+}
+
+#[derive(clap::Args, Debug)]
+struct Download {
+    #[clap(short = 'o', long = "to", default_value = ".")]
+    out_path: std::path::PathBuf,
+    /// The path to read from
+    path: PathBuf,
+}
+
+#[derive(clap::Args, Debug)]
 struct MagnetParse {
     str: String,
 }
@@ -77,20 +95,12 @@ pub struct MagnetInfo {
 }
 
 #[derive(clap::Args, Debug)]
-struct DownloadPiece {
+pub struct MagnetDownloadPiece {
     #[clap(short = 'o', long = "to", default_value = ".")]
     out_path: std::path::PathBuf,
-    /// The path to read from
-    path: PathBuf,
+    /// The link to process from
+    link: String,
     piece: usize,
-}
-
-#[derive(clap::Args, Debug)]
-struct Download {
-    #[clap(short = 'o', long = "to", default_value = ".")]
-    out_path: std::path::PathBuf,
-    /// The path to read from
-    path: PathBuf,
 }
 
 fn decode(bencode: &[u8]) {
@@ -162,7 +172,7 @@ async fn download_piece(
     out_path: impl AsRef<Path>,
     path: impl AsRef<Path>,
     piece_nr: usize,
-    my_peer_id: [u8; 20],
+    my_peer_id: Sha1Hash,
 ) -> anyhow::Result<()> {
     // 1) Read the torrent file to get the tracker URL
     eprintln!("reading torrent file");
@@ -203,11 +213,11 @@ async fn download_piece(
         }
     }
 
-    let (mut stream, _bf, _) = s.unwrap()?;
+    let (stream, _bf, _) = s.unwrap()?;
 
     // 4.2) Send an interested message
     eprintln!("sending interested packet");
-    torrent::send_interested(&mut stream).await?;
+    torrent::send_interested(&stream).await?;
 
     // 4.3) Wait until you receive an unchoke message back
     eprintln!("waiting for unchoke packet");
@@ -225,7 +235,7 @@ async fn download_piece(
 
     // 4.4 - 6)
     let storage = torrent::download_piece(
-        &mut stream,
+        &stream,
         piece_nr,
         piece_length,
         &torrent.info.pieces[piece_nr],
@@ -300,7 +310,7 @@ async fn handle_peer(
 
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
-    let (mut stream, _, _) = match s {
+    let (stream, _, _) = match s {
         Some(s) => s,
         None => {
             eprintln!("given up in {}", peer);
@@ -310,7 +320,7 @@ async fn handle_peer(
 
     // 4.2) Send an interested message
     eprintln!("sending interested packet for {peer}");
-    torrent::send_interested(&mut stream).await?;
+    torrent::send_interested(&stream).await?;
 
     // 4.3) Wait until you receive an unchoke message back
     eprintln!("waiting for unchoke packet from {peer}");
@@ -330,7 +340,7 @@ async fn handle_peer(
             }
         };
 
-        match torrent::download_piece(&mut stream, piece.nr, piece.len, &piece.hash).await {
+        match torrent::download_piece(&stream, piece.nr, piece.len, &piece.hash).await {
             Ok(v) => send_res.send((piece, v)).await?,
             Err(err) => {
                 // try to download it again next round
@@ -531,6 +541,73 @@ Piece Hashes:
     Ok(())
 }
 
+async fn magnet_download_piece(
+    out_path: impl AsRef<Path>,
+    link: &str,
+    piece_nr: usize,
+    my_peer_id: Sha1Hash,
+) -> anyhow::Result<()> {
+    let link = torrent::TorrentMagnet::try_from(link).map_err(|e| anyhow!("{e}"))?;
+
+    let tracker = torrent::peers_load(
+        &link.tracker,
+        link.hash,
+        999, // random value as the "left" (lenght) value is required by the tracker
+        my_peer_id,
+    )
+    .await?;
+
+    // random one
+    let peer = tracker.peers[0];
+
+    let (stream, _res, ext_id) =
+        torrent::magnet_create_peer_connect(link.hash, peer, my_peer_id).await?;
+    // we only use pice 0 here as that meta data contains all the block we require
+    let torrent = torrent::magnet_load_meta_data(&stream, ext_id, 0).await?;
+
+    // 4.2) Send an interested message
+    eprintln!("sending interested packet for {peer}");
+    torrent::send_interested(&stream).await?;
+
+    // 4.3) Wait until you receive an unchoke message back
+    eprintln!("waiting for unchoke packet from {peer}");
+    torrent::wait_for_unchoke(&stream).await?;
+
+    eprintln!("processing for {peer}");
+    let piece_length = if torrent.pieces.len() - 1 == piece_nr {
+        // last piece
+        eprintln!("last piece");
+        torrent.length % torrent.piece_length
+    } else {
+        torrent.piece_length
+    };
+
+    // 4.4 - 6)
+    let storage =
+        torrent::download_piece(&stream, piece_nr, piece_length, &torrent.pieces[piece_nr])
+            .await
+            .context("able to download a piece")?;
+
+    // make sure that the slate is clean
+    if out_path.as_ref().exists() {
+        tokio::fs::remove_file(out_path.as_ref()).await?;
+    } else if let Some(parent) = out_path.as_ref().parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    tokio::fs::write(&out_path, storage)
+        .await
+        .context("able to write content")?;
+
+    println!(
+        "Piece {} downloaded to {}.",
+        piece_nr,
+        out_path.as_ref().display()
+    );
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -551,6 +628,9 @@ async fn main() -> anyhow::Result<()> {
         Commands::MagnetParse(mp) => magnet_parse(&mp.str).await?,
         Commands::MagnetHandshake(mh) => magnet_handshake(&mh.str, my_peer_id).await?,
         Commands::MagnetInfo(mi) => magnet_info(&mi.str, my_peer_id).await?,
+        Commands::MagnetDownloadPiece(mdp) => {
+            magnet_download_piece(mdp.out_path, &mdp.link, mdp.piece, my_peer_id).await?
+        }
     }
 
     Ok(())
